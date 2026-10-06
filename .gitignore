@@ -153,3 +153,9 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# BELLS local build and benchmark leftovers
+/*.zip
+/release-packages/
+/brag-output/
+/mtp_fix.patch

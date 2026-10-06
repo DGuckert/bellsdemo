@@ -2545,6 +2545,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -4311,12 +4312,109 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // a run of scale and unary ops over one tensor, e.g. scale -> sigmoid -> scale
+    static const bool disable_unary_chain = getenv("GGML_CUDA_DISABLE_UNARY_CHAIN") != nullptr;
+    if (!disable_unary_chain && (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY)) {
+        ggml_cuda_unary_chain chain;
+        enum ggml_op ops[GGML_CUDA_UNARY_CHAIN_MAX];
+        int n = 0;
+        while (n < GGML_CUDA_UNARY_CHAIN_MAX && i + n < cgraph->n_nodes) {
+            const ggml_tensor * t = cgraph->nodes[i + n];
+            if (t->type != GGML_TYPE_F32 || (n > 0 && t->src[0] != cgraph->nodes[i + n - 1]) ||
+                    !ggml_cuda_unary_chain_step(t, chain)) {
+                break;
+            }
+            ops[n++] = t->op;
+        }
+        // shorten from the end until every inner node is used by the chain alone
+        // no memory range check: element i is read before it is written, so an in-place dst is fine
+        for (; n >= 2; --n) {
+            const int out_idx = i + n - 1;
+            if (node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
+                    ggml_can_fuse(cgraph, i, ops, n)) {
+                chain.n = n;
+                ggml_cuda_op_unary_chain(*cuda_ctx, node->src[0], cgraph->nodes[out_idx], chain);
+                return n - 1;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
     }
 
     return 0;
+}
+
+static bool ggml_cuda_profile_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_PROFILE") != nullptr;
+    return enabled;
+}
+
+struct ggml_cuda_profile_state {
+    std::map<std::string, std::pair<uint64_t, uint64_t>> ops; // key -> (calls, us)
+    uint64_t n_nodes = 0;
+
+    ~ggml_cuda_profile_state() {
+        print();
+    }
+
+    // cumulative; also called every so many nodes, since a server killed at shutdown never runs the destructor
+    void print() const {
+        if (ops.empty()) {
+            return;
+        }
+        std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> v(ops.begin(), ops.end());
+        std::sort(v.begin(), v.end(), [](const auto & x, const auto & y) { return x.second.second > y.second.second; });
+        uint64_t total = 0;
+        for (const auto & e : v) {
+            total += e.second.second;
+        }
+        fprintf(stderr, "cuda_profile: %llu nodes, %.1f ms total\n", (unsigned long long) n_nodes, total/1000.0);
+        for (size_t i = 0; i < v.size() && i < 40; i++) {
+            fprintf(stderr, "cuda_profile: %-34s calls %8llu  %10.1f ms  %5.1f%%  %7.1f us/call\n",
+                    v[i].first.c_str(), (unsigned long long) v[i].second.first, v[i].second.second/1000.0,
+                    100.0*v[i].second.second/total, (double) v[i].second.second/v[i].second.first);
+        }
+    }
+};
+
+static void ggml_cuda_profile_add(const ggml_tensor * node, int64_t us) {
+    static ggml_cuda_profile_state state;
+    // batch = tokens in the ubatch for the ops whose cost should not grow with it
+    const int64_t n_tok = node->op == GGML_OP_MUL_MAT_ID ? node->ne[2] : node->ne[1];
+    std::string key = ggml_op_name(node->op);
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GET_ROWS) {
+        key += std::string(" ") + ggml_type_name(node->src[0]->type);
+    }
+    key += " n=" + std::to_string((long long) (n_tok > 8 ? 9 : n_tok));
+    if (node->op == GGML_OP_MUL_MAT && !ggml_is_quantized(node->src[0]->type)) {
+        // size class of the weight matrix: the kernel choice that suits a big one is wrong for a small one
+        const int64_t elems = node->src[0]->ne[0]*node->src[0]->ne[1];
+        key += elems <= 65536 ? " <=64K" : elems <= 1048576 ? " <=1M" : elems <= 8388608 ? " <=8M" : " >8M";
+    }
+    auto & e = state.ops[key];
+    e.first  += 1;
+    e.second += (uint64_t) us;
+    state.n_nodes++;
+
+    // GGML_CUDA_PROFILE_DUMP=first,count lists the nodes as they run, to see which ops sit next to each other
+    static const char * dump = getenv("GGML_CUDA_PROFILE_DUMP");
+    if (dump) {
+        static const uint64_t first = strtoull(dump, nullptr, 10);
+        static const uint64_t count = strchr(dump, ',') ? strtoull(strchr(dump, ',') + 1, nullptr, 10) : 300;
+        if (state.n_nodes > first && state.n_nodes <= first + count) {
+            fprintf(stderr, "cuda_node: %-18s %-6s %-34s [%lld,%lld,%lld] %5lld us\n",
+                    ggml_op_desc(node), node->src[0] ? ggml_type_name(node->src[0]->type) : "-", node->name,
+                    (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) us);
+        }
+    }
+    // GGML_CUDA_PROFILE=N prints the table every N nodes (N > 1), by default every 2 million
+    static const uint64_t interval = atoll(getenv("GGML_CUDA_PROFILE")) > 1 ? (uint64_t) atoll(getenv("GGML_CUDA_PROFILE")) : 2000000;
+    if (state.n_nodes % interval == 0) {
+        state.print();
+    }
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -4488,7 +4586,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // GGML_CUDA_PROFILE=1: time every node with a stream sync on each side. The syncs slow the
+                // compute, so this shows where the time goes, not how fast it is. A capturing stream cannot
+                // be synchronised, so set GGML_CUDA_DISABLE_GRAPHS=1 with it.
+                const bool profile = ggml_cuda_profile_enabled() && !use_cuda_graph;
+                int64_t t_prof = 0;
+                if (profile) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    t_prof = ggml_time_us();
+                }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+
+                if (profile) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    ggml_cuda_profile_add(node, ggml_time_us() - t_prof);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5922,8 +6035,57 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+template <typename T>
+static __global__ void k_gather_blocks(const T * src, T * dst, const int32_t * map, const int64_t n_per_block) {
+    const int32_t s = map[blockIdx.y];
+    if (s < 0) {
+        return;
+    }
+    const T * sp = src + (int64_t) s*n_per_block;
+    T *       dp = dst + (int64_t) blockIdx.y*n_per_block;
+    const int64_t step = (int64_t) gridDim.x*blockDim.x;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n_per_block; i += step) {
+        dp[i] = sp[i];
+    }
+}
+
+// dst block x <- src block map[x] for every map[x] >= 0, blocks of block_bytes, in one launch on the backend's
+// stream. Returns once queued; map may be reused by the caller straight away.
+static bool ggml_backend_cuda_gather_blocks(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * src,
+                                            const int32_t * map, int n_blocks, size_t block_bytes) {
+    if (!ggml_backend_is_cuda(backend) || n_blocks <= 0 || n_blocks > 65535 || block_bytes == 0) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream();
+
+    ggml_cuda_pool_alloc<int32_t> map_dev(cuda_ctx->pool(), n_blocks);
+    // pageable source: the driver has taken the bytes by the time this returns
+    CUDA_CHECK(cudaMemcpyAsync(map_dev.get(), map, n_blocks*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    const dim3 block(256, 1, 1);
+    const dim3 grid(32, n_blocks, 1);
+    const bool a8 = block_bytes % 8 == 0 && (uintptr_t) src->data % 8 == 0 && (uintptr_t) dst->data % 8 == 0;
+    const bool a4 = block_bytes % 4 == 0 && (uintptr_t) src->data % 4 == 0 && (uintptr_t) dst->data % 4 == 0;
+    if (a8) {
+        k_gather_blocks<uint64_t><<<grid, block, 0, stream>>>((const uint64_t *) src->data, (uint64_t *) dst->data,
+                                                              map_dev.get(), (int64_t) (block_bytes/8));
+    } else if (a4) {
+        k_gather_blocks<uint32_t><<<grid, block, 0, stream>>>((const uint32_t *) src->data, (uint32_t *) dst->data,
+                                                              map_dev.get(), (int64_t) (block_bytes/4));
+    } else {
+        k_gather_blocks<uint8_t><<<grid, block, 0, stream>>>((const uint8_t *) src->data, (uint8_t *) dst->data,
+                                                             map_dev.get(), (int64_t) block_bytes);
+    }
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_gather_blocks") == 0) {
+        return (void *)ggml_backend_cuda_gather_blocks;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

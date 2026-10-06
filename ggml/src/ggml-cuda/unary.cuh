@@ -95,6 +95,29 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+// a chain of scale and unary ops on one tensor, run as a single kernel
+#define GGML_CUDA_UNARY_CHAIN_MAX 4
+
+enum ggml_cuda_unary_chain_kind {
+    GGML_CUDA_UNARY_CHAIN_SCALE,
+    GGML_CUDA_UNARY_CHAIN_SIGMOID,
+    GGML_CUDA_UNARY_CHAIN_SILU,
+    GGML_CUDA_UNARY_CHAIN_TANH,
+    GGML_CUDA_UNARY_CHAIN_SOFTPLUS,
+};
+
+struct ggml_cuda_unary_chain {
+    int   n = 0;
+    int   kind[GGML_CUDA_UNARY_CHAIN_MAX]  = {};
+    float scale[GGML_CUDA_UNARY_CHAIN_MAX] = {};
+    float bias[GGML_CUDA_UNARY_CHAIN_MAX]  = {};
+};
+
+// appends node to the chain, false if the op is not one the chain kernel runs
+bool ggml_cuda_unary_chain_step(const ggml_tensor * node, ggml_cuda_unary_chain & chain);
+
+void ggml_cuda_op_unary_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_cuda_unary_chain & chain);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

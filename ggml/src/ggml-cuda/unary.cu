@@ -733,3 +733,69 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* fused chain of scale and unary ops */
+
+template <typename T>
+static __global__ void unary_chain_kernel(const T * x, T * dst, const int k, const ggml_cuda_unary_chain chain) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    float v = ggml_cuda_cast<float>(x[i]);
+    for (int s = 0; s < chain.n; ++s) {
+        switch (chain.kind[s]) {
+            case GGML_CUDA_UNARY_CHAIN_SCALE:    v = chain.scale[s]*v + chain.bias[s]; break;
+            case GGML_CUDA_UNARY_CHAIN_SIGMOID:  v = op_sigmoid(v);                    break;
+            case GGML_CUDA_UNARY_CHAIN_SILU:     v = op_silu(v);                       break;
+            case GGML_CUDA_UNARY_CHAIN_TANH:     v = op_tanh(v);                       break;
+            case GGML_CUDA_UNARY_CHAIN_SOFTPLUS: v = op_softplus(v);                   break;
+        }
+    }
+    dst[i] = ggml_cuda_cast<T>(v);
+}
+
+bool ggml_cuda_unary_chain_step(const ggml_tensor * node, ggml_cuda_unary_chain & chain) {
+    if (chain.n >= GGML_CUDA_UNARY_CHAIN_MAX) {
+        return false;
+    }
+    int   kind  = -1;
+    float scale = 1.0f;
+    float bias  = 0.0f;
+    if (node->op == GGML_OP_SCALE) {
+        kind = GGML_CUDA_UNARY_CHAIN_SCALE;
+        memcpy(&scale, (const float *) node->op_params + 0, sizeof(float));
+        memcpy(&bias,  (const float *) node->op_params + 1, sizeof(float));
+    } else if (node->op == GGML_OP_UNARY) {
+        switch (ggml_get_unary_op(node)) {
+            case GGML_UNARY_OP_SIGMOID:  kind = GGML_CUDA_UNARY_CHAIN_SIGMOID;  break;
+            case GGML_UNARY_OP_SILU:     kind = GGML_CUDA_UNARY_CHAIN_SILU;     break;
+            case GGML_UNARY_OP_TANH:     kind = GGML_CUDA_UNARY_CHAIN_TANH;     break;
+            case GGML_UNARY_OP_SOFTPLUS: kind = GGML_CUDA_UNARY_CHAIN_SOFTPLUS; break;
+            default:                     return false;
+        }
+    } else {
+        return false;
+    }
+    chain.kind[chain.n]  = kind;
+    chain.scale[chain.n] = scale;
+    chain.bias[chain.n]  = bias;
+    chain.n++;
+    return true;
+}
+
+void ggml_cuda_op_unary_chain(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, const ggml_cuda_unary_chain & chain) {
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
+
+    const int k = ggml_nelements(src);
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(unary_chain_kernel<float>, launch_params, (const float *) src->data, (float *) dst->data, k, chain);
+}

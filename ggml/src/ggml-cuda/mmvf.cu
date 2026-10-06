@@ -789,6 +789,25 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// Ampere switches F16/BF16 to the tensor-core kernel from 2 columns up. That kernel's fixed cost per launch is
+// several times the vector kernel's, which only pays back on a large matrix: on the 177B's small hyper-connection
+// mixers (about 970 BF16 multiplies per pass) a 3-token batch measured 47 us per call against 16 us for 1 token.
+// So a matrix of up to 1M elements stays on the vector kernel for up to 4 columns, the range measured on an A10G
+// (3 columns: <=64K elements 99 -> 17 us per call, <=1M 36 -> 13 us; above 1M both kernels cost the same).
+// GGML_CUDA_MMVF_MAX_COLS=N and GGML_CUDA_MMVF_MAX_ELEMS=N override it; MAX_COLS=1 is upstream's behaviour and
+// MAX_ELEMS=0 lifts the size limit.
+static int64_t ggml_cuda_mmvf_ampere_max_cols(const int64_t * src0_ne) {
+    static const int64_t max_cols  = getenv("GGML_CUDA_MMVF_MAX_COLS")  ? atoll(getenv("GGML_CUDA_MMVF_MAX_COLS"))  : 4;
+    static const int64_t max_elems = getenv("GGML_CUDA_MMVF_MAX_ELEMS") ? atoll(getenv("GGML_CUDA_MMVF_MAX_ELEMS")) : 1048576;
+    if (max_cols <= 1) {
+        return 1;
+    }
+    if (max_elems > 0 && src0_ne[0]*src0_ne[1] > max_elems) {
+        return 1;
+    }
+    return max_cols < MMVF_MAX_BATCH_SIZE ? max_cols : MMVF_MAX_BATCH_SIZE;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -827,7 +846,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return src0_small && ne11 <= ggml_cuda_mmvf_ampere_max_cols(src0_ne);
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;
@@ -853,7 +872,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return src0_small && ne11 <= ggml_cuda_mmvf_ampere_max_cols(src0_ne);
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;

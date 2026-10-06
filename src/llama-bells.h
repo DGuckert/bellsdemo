@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -75,6 +76,8 @@ public:
 
     void reset_counters() { n_hit_ = 0; n_miss_ = 0; }
 
+    void print_layer_stats() const;
+
     void set_use_usage(bool v) { use_usage_ = v; }
     uint32_t reuse_decay() const { return use_usage_ ? 1 : 0; }
     void set_reuse_decay(uint32_t decay, bool reset_history);
@@ -117,6 +120,12 @@ private:
 
     uint64_t n_hit_  = 0;
     uint64_t n_miss_ = 0;
+
+    // BELLS_LAYER_STATS: raw lookups and misses per layer, and lookups per expert
+    bool                               layer_stats_ = false;
+    std::vector<uint64_t>              layer_look_;
+    std::vector<uint64_t>              layer_miss_;
+    std::vector<std::vector<uint32_t>> layer_count_;
 
     std::vector<layer> layers_;
 };
@@ -205,6 +214,37 @@ public:
     ggml_tensor * slots(uint32_t il)   const { return get(il).slots;   }
 
     bool has(uint32_t il) const { return il < index_.size() && index_[il] >= 0; }
+
+    // Whole-layer staging for prompt batches: one device copy of a layer's full expert stack, refilled with
+    // each layer's experts just before that layer runs. A prompt ubatch routes to nearly every expert, so the
+    // cache cannot serve it; this replaces a few hundred 1 MiB demand copies per layer with one bulk copy.
+    static size_t pstage_bytes(const std::vector<layer_src> & srcs);
+    static int    pstage_sets_wanted();
+    bool init_pstage(ggml_backend_buffer_type_t buft);
+    bool pstage_ready() const { return pstage_buf_ != nullptr; }
+    // experts/n: the ubatch's routing for this layer; only those experts are copied. Null copies every expert.
+    // next_table: the cache's expert -> slot table of the next expert layer. Its resident experts are taken
+    // from the cache, device to device, and only the others cross PCIe.
+    void stage_layer(uint32_t il, const int32_t * experts = nullptr, size_t n = 0,
+                     const std::vector<int32_t> * next_table = nullptr);
+    // the expert layer after il, or -1
+    int32_t next_layer(uint32_t il) const {
+        if (!has(il) || (size_t) index_[il] + 1 >= entries_.size()) {
+            return -1;
+        }
+        return entries_[index_[il] + 1].src.il;
+    }
+    // With two staging sets, consecutive expert layers alternate between them, so the next layer's experts
+    // can stream in on a second stream while the current layer's matmuls read the other set.
+    int pstage_set(uint32_t il) const { return has(il) ? index_[il] % pstage_n_sets_ : 0; }
+    ggml_tensor * pstage_gate(uint32_t il)    const { return pstage_t_[pstage_set(il)][0]; }
+    ggml_tensor * pstage_up(uint32_t il)      const { return pstage_t_[pstage_set(il)][1]; }
+    ggml_tensor * pstage_down(uint32_t il)    const { return pstage_t_[pstage_set(il)][2]; }
+    ggml_tensor * pstage_gate_up(uint32_t il) const { return pstage_t_[pstage_set(il)][3]; }
+    int pstage_n_sets() const { return pstage_n_sets_; }
+    // cumulative microseconds: look-ahead copies on their thread, compute thread waiting for them, and copying itself
+    void pstage_times(uint64_t & copy_us, uint64_t & wait_us, uint64_t & sync_us) const;
+    uint64_t n_pstaged() const { return n_pstaged_; }
 
     // model layer ids that carry experts, in order
     const std::vector<int32_t> & layers() const { return layer_ids_; }
@@ -305,6 +345,30 @@ private:
     // layer-call, so for any model too large to load with --cpu-moe-pinned this is the single
     // largest cost in the cache path.
     ggml_backend_buffer_type_t host_buft_  = nullptr;   // pinned host buffer type, if any
+    ggml_context *             pstage_ctx_ = nullptr;
+    ggml_backend_buffer_t      pstage_buf_ = nullptr;
+    ggml_tensor *              pstage_t_[2][4] = {};       // [set][gate, up, down, gate_up]
+    int                        pstage_n_sets_ = 1;
+    ggml_backend_t             pstage_backend_ = nullptr;  // second stream, for the look-ahead copy
+    ggml_backend_event_t       pstage_event_[2] = { nullptr, nullptr };
+    bool                       pstage_pending_[2] = { false, false };
+    int32_t                    pstage_layer_[2] = { -1, -1 };  // layer whose FULL stack the set holds, or -1
+    uint64_t                   n_pstage_ahead_ = 0;        // layers that arrived by look-ahead
+    uint64_t                   n_pstage_d2d_   = 0;        // look-ahead experts taken from the cache
+    uint64_t                   n_pstage_h2d_   = 0;        // look-ahead experts sent from the host
+    typedef bool (*pstage_gather_fn)(ggml_backend_t, ggml_tensor *, const ggml_tensor *, const int32_t *, int, size_t);
+    pstage_gather_fn           pstage_gather_ = nullptr;   // backend's one-launch block gather, when it has one
+    struct pstage_worker;                                  // thread that runs the look-ahead copies
+    std::shared_ptr<pstage_worker> pstage_w_;
+    void pstage_wait();
+    uint64_t                   pstage_wait_us_ = 0;        // compute thread blocked on a look-ahead copy
+    uint64_t                   pstage_sync_us_ = 0;        // compute thread copying a layer itself
+    ggml_tensor *              pstage_view_src_[4] = {};   // one-expert scratch tensors, re-pointed per copy
+    ggml_tensor *              pstage_view_dst_[4] = {};
+    uint64_t                   n_pstaged_  = 0;
+    uint64_t                   n_pstage_experts_ = 0;   // experts copied, of n_pstaged_ * n_expert possible
+    std::vector<uint8_t>       pstage_used_;
+
     ggml_backend_buffer_t      stage_buf_  = nullptr;
     char *                     stage_ptr_  = nullptr;
     size_t                     stage_cap_  = 0;
@@ -539,7 +603,21 @@ public:
         return ready_ && !params_.passive && n_tokens <= (int64_t) params_.max_tokens;
     }
 
+    // A ubatch too wide for the cache runs against the staged copy of each layer's experts, when there is one.
+    bool staging(int64_t n_tokens) const {
+        return ready_ && !params_.passive && tensors_.pstage_ready() && n_tokens > (int64_t) params_.max_tokens;
+    }
+
+    bool staging_now() const { return staging_now_; }
+
+    // A batch of at least this many tokens is worth the fixed cost of staging every layer once per ubatch
+    // (about one layer's experts over PCIe, 48 times); a shorter one is cheaper in cache-sized ubatches.
+    uint32_t pstage_min_tokens() const { return pstage_min_tokens_; }
+
     bool passive() const { return params_.passive; }
+
+    // largest ubatch the cache serves; a bigger one falls back to the host expert path
+    uint32_t max_tokens() const { return params_.max_tokens; }
 
     // experts per token routed to the GPU cache; the remainder go to the CPU path
     uint32_t split() const { return params_.split; }
@@ -734,7 +812,10 @@ private:
     bool     ready_      = false;
     bool     active_now_ = false;
     bool     was_prefill_ = true;
+    bool     staging_now_ = false;
+    uint32_t pstage_min_tokens_ = 192;
     uint64_t n_copied_   = 0;
+    uint64_t n_skipped_  = 0;   // BELLS_SKIP_MISS_RANK: weak experts left out instead of fetched
     uint64_t n_bytes_moved_ = 0;
 
     uint64_t n_tok_seen_    = 0;   // ubatches served, drives the refresh rotation

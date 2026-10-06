@@ -57,6 +57,66 @@ void bells_cache::init(uint32_t n_layer, uint32_t n_expert, const std::vector<ui
     n_hit_    = 0;
     n_miss_   = 0;
     n_pinned_ = 0;
+
+    layer_stats_ = getenv("BELLS_LAYER_STATS") != nullptr;
+    if (layer_stats_) {
+        layer_look_.assign(n_layer, 0);
+        layer_miss_.assign(n_layer, 0);
+        layer_count_.assign(n_layer, std::vector<uint32_t>(n_expert_, 0));
+    }
+}
+
+// Per layer: the miss rate at its slot count, and how many experts cover 90/95/98/99% of its lookups.
+// A layer that needs far more experts than it has slots is where extra slots would pay.
+void bells_cache::print_layer_stats() const {
+    if (!layer_stats_) {
+        return;
+    }
+
+    // BELLS_LAYER_STATS=<file> also saves the counts, the input of BELLS_LAYER_PROFILE. A one-layer cache is the
+    // MTP draft block's, which must not overwrite the target's profile.
+    uint32_t n_seen = 0;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        n_seen += layer_look_[il] > 0;
+    }
+    const char * path = getenv("BELLS_LAYER_STATS");
+    if (path && path[0] && strcmp(path, "1") != 0 && n_seen > 1) {
+        std::ofstream out(path);
+        for (uint32_t il = 0; il < n_layer_ && out; ++il) {
+            if (layer_look_[il] == 0) {
+                continue;
+            }
+            std::vector<uint32_t> c = layer_count_[il];
+            std::sort(c.begin(), c.end(), [](uint32_t a, uint32_t b) { return a > b; });
+            out << il;
+            for (uint32_t v : c) {
+                out << ' ' << v;
+            }
+            out << '\n';
+        }
+        fprintf(stderr, "bells_layer: profile of %u layers written to '%s'\n", n_seen, path);
+    }
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        const uint64_t tot = layer_look_[il];
+        if (tot == 0) {
+            continue;
+        }
+        std::vector<uint32_t> c = layer_count_[il];
+        std::sort(c.begin(), c.end(), [](uint32_t a, uint32_t b) { return a > b; });
+        const double want[4] = { 0.90, 0.95, 0.98, 0.99 };
+        uint32_t need[4] = { 0, 0, 0, 0 };
+        uint64_t acc = 0;
+        int w = 0;
+        for (uint32_t i = 0; i < c.size() && w < 4; ++i) {
+            acc += c[i];
+            while (w < 4 && (double) acc >= want[w]*(double) tot) {
+                need[w++] = i + 1;
+            }
+        }
+        fprintf(stderr, "bells_layer: il %2u slots %3u miss %5.2f%% lookups %llu cover90/95/98/99 %u %u %u %u\n",
+                il, n_slot_per_layer_[il], 100.0*(double) layer_miss_[il]/(double) tot, (unsigned long long) tot,
+                need[0], need[1], need[2], need[3]);
+    }
 }
 
 void bells_cache::reset() {
@@ -316,6 +376,11 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
 
         l.usage[e] += 1.0f;
 
+        if (layer_stats_) {
+            layer_look_[il]++;
+            layer_count_[il][e]++;
+        }
+
         if (l.expert_slot[e] >= 0) {
             n_hit_++;
             l.last_used[l.expert_slot[e]] = clock_;
@@ -323,6 +388,9 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
         }
 
         n_miss_++;
+        if (layer_stats_) {
+            layer_miss_[il]++;
+        }
 
         const int32_t s = victim(l, n_slot_per_layer_[il], experts, n, protect);
         if (s < 0) {
@@ -909,9 +977,432 @@ void bells_tensors::warm_lookahead(uint32_t il_next) {
     warm_skip_ = warm_backoff_ - 1;
 }
 
+size_t bells_tensors::pstage_bytes(const std::vector<layer_src> & srcs) {
+    size_t total = 0;
+    if (!srcs.empty()) {
+        for (ggml_tensor * t : { srcs[0].gate, srcs[0].up, srcs[0].down, srcs[0].gate_up }) {
+            if (t) {
+                total += ggml_nbytes(t);
+            }
+        }
+    }
+    return total;
+}
+
+// One copy of the look-ahead: host bytes, or one resident expert out of the cache.
+struct bells_pstage_op {
+    ggml_tensor * dst    = nullptr;
+    const void *  host   = nullptr;   // host source, or nullptr for a cache copy
+    ggml_tensor * cache  = nullptr;
+    int           i      = 0;         // which of gate/up/down/gate_up, for the scratch views
+    size_t        dst_off = 0;
+    size_t        src_off = 0;
+    size_t        size    = 0;
+    std::vector<int32_t> map;         // gather: cache slot per expert, -1 to leave alone; size is one expert then
+};
+
+// cudaMemcpyAsync from pageable memory returns only once the driver has taken the host bytes, so issued from
+// the compute thread the look-ahead stalled it for the whole copy. The worker owns the second stream instead.
+struct bells_tensors::pstage_worker {
+    std::thread                  th;
+    std::mutex                   mu;
+    std::condition_variable      cv;
+    std::vector<bells_pstage_op> job;
+    bool                         ready = false;
+    bool                         busy  = false;
+    bool                         quit  = false;
+    uint64_t                     copy_us = 0;
+};
+
+void bells_tensors::pstage_times(uint64_t & copy_us, uint64_t & wait_us, uint64_t & sync_us) const {
+    copy_us = 0;
+    if (pstage_w_) {
+        std::lock_guard<std::mutex> lock(pstage_w_->mu);
+        copy_us = pstage_w_->copy_us;
+    }
+    wait_us = pstage_wait_us_;
+    sync_us = pstage_sync_us_;
+}
+
+void bells_tensors::pstage_wait() {
+    if (!pstage_w_) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    std::unique_lock<std::mutex> lock(pstage_w_->mu);
+    pstage_w_->cv.wait(lock, [&] { return !pstage_w_->ready && !pstage_w_->busy; });
+    pstage_wait_us_ += (uint64_t) (ggml_time_us() - t0);
+}
+
+bool bells_tensors::init_pstage(ggml_backend_buffer_type_t buft) {
+    if (entries_.empty() || cache_type_ != GGML_TYPE_COUNT || buffers_.size() > 1) {
+        return false;
+    }
+    // one staging copy serves every layer, so every layer's expert tensors must have one layout
+    const layer_src & s0 = entries_[0].src;
+    ggml_tensor * tmpl[4] = { s0.gate, s0.up, s0.down, s0.gate_up };
+    for (const auto & e : entries_) {
+        ggml_tensor * cur[4] = { e.src.gate, e.src.up, e.src.down, e.src.gate_up };
+        for (int i = 0; i < 4; ++i) {
+            if ((cur[i] == nullptr) != (tmpl[i] == nullptr)) {
+                return false;
+            }
+            if (cur[i] && (cur[i]->type != tmpl[i]->type || !ggml_are_same_shape(cur[i], tmpl[i]) || !cur[i]->data)) {
+                return false;
+            }
+        }
+    }
+
+    // The second set needs its own stream and one event per set; without them fall back to one set.
+    pstage_n_sets_ = 1;
+    if (pstage_sets_wanted() == 2 && backend_) {
+        if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+            pstage_backend_  = ggml_backend_dev_init(dev, nullptr);
+            pstage_event_[0] = pstage_backend_ ? ggml_backend_event_new(dev) : nullptr;
+            pstage_event_[1] = pstage_backend_ ? ggml_backend_event_new(dev) : nullptr;
+        }
+        if (pstage_backend_ && pstage_event_[0] && pstage_event_[1]) {
+            pstage_n_sets_ = 2;
+            if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_))) {
+                pstage_gather_ = (pstage_gather_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_gather_blocks");
+            }
+        }
+    }
+
+    pstage_ctx_ = ggml_init({ ggml_tensor_overhead()*16, nullptr, true });
+    if (!pstage_ctx_) {
+        return false;
+    }
+    for (int k = 0; k < pstage_n_sets_; ++k) {
+        for (int i = 0; i < 4; ++i) {
+            if (tmpl[i]) {
+                pstage_t_[k][i] = ggml_new_tensor_3d(pstage_ctx_, tmpl[i]->type, tmpl[i]->ne[0], tmpl[i]->ne[1], tmpl[i]->ne[2]);
+            }
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (tmpl[i] && pstage_n_sets_ == 2) {
+            pstage_view_src_[i] = ggml_new_tensor_3d(pstage_ctx_, tmpl[i]->type, tmpl[i]->ne[0], tmpl[i]->ne[1], 1);
+            pstage_view_dst_[i] = ggml_new_tensor_3d(pstage_ctx_, tmpl[i]->type, tmpl[i]->ne[0], tmpl[i]->ne[1], 1);
+        }
+    }
+    ggml_backend_buffer_type_t target = s0.buft ? s0.buft : buft;
+    pstage_buf_ = ggml_backend_alloc_ctx_tensors_from_buft(pstage_ctx_, target);
+    if (!pstage_buf_) {
+        ggml_free(pstage_ctx_);
+        pstage_ctx_ = nullptr;
+        for (auto & set : pstage_t_) {
+            for (auto & t : set) {
+                t = nullptr;
+            }
+        }
+        return false;
+    }
+    pstage_layer_[0] = pstage_layer_[1] = -1;
+    pstage_pending_[0] = pstage_pending_[1] = false;
+    if (pstage_n_sets_ == 2) {
+        pstage_w_ = std::make_shared<pstage_worker>();
+        pstage_worker * w  = pstage_w_.get();
+        ggml_backend_t  be = pstage_backend_;
+        ggml_tensor *   vs[4] = { pstage_view_src_[0], pstage_view_src_[1], pstage_view_src_[2], pstage_view_src_[3] };
+        ggml_tensor *   vd[4] = { pstage_view_dst_[0], pstage_view_dst_[1], pstage_view_dst_[2], pstage_view_dst_[3] };
+        const pstage_gather_fn gather = pstage_gather_;
+        w->th = std::thread([w, be, vs, vd, gather]() {
+            std::vector<bells_pstage_op> job;
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lock(w->mu);
+                    w->cv.wait(lock, [&] { return w->ready || w->quit; });
+                    if (w->quit) {
+                        return;
+                    }
+                    job.swap(w->job);
+                    w->ready = false;
+                    w->busy  = true;
+                }
+                const int64_t t0 = ggml_time_us();
+                for (const bells_pstage_op & op : job) {
+                    if (op.host) {
+                        ggml_backend_tensor_set_async(be, op.dst, op.host, op.dst_off, op.size);
+                    } else if (!op.map.empty()) {
+                        gather(be, op.dst, op.cache, op.map.data(), (int) op.map.size(), op.size);
+                    } else {
+                        vs[op.i]->buffer = op.cache->buffer;
+                        vs[op.i]->data   = (char *) op.cache->data + op.src_off;
+                        vd[op.i]->buffer = op.dst->buffer;
+                        vd[op.i]->data   = (char *) op.dst->data + op.dst_off;
+                        ggml_backend_tensor_copy_async(be, be, vs[op.i], vd[op.i]);
+                    }
+                }
+                ggml_backend_synchronize(be);
+                job.clear();
+                {
+                    std::lock_guard<std::mutex> lock(w->mu);
+                    w->copy_us += (uint64_t) (ggml_time_us() - t0);
+                    w->busy = false;
+                }
+                w->cv.notify_all();
+            }
+        });
+    }
+    return true;
+}
+
+int bells_tensors::pstage_sets_wanted() {
+    const char * s = getenv("BELLS_PREFILL_SETS");
+    return (s && atoi(s) == 1) ? 1 : 2;
+}
+
+void bells_tensors::stage_layer(uint32_t il, const int32_t * experts, size_t n, const std::vector<int32_t> * next_table) {
+    if (!pstage_buf_ || !has(il)) {
+        return;
+    }
+    const layer_src & s = get(il).src;
+    ggml_tensor * src[4] = { s.gate, s.up, s.down, s.gate_up };
+    const int k = pstage_set(il);
+    ggml_tensor ** pstage_cur = pstage_t_[k];
+
+    ggml_tensor * any = nullptr;
+    for (ggml_tensor * t : src) {
+        if (t) {
+            any = t;
+        }
+    }
+    if (!any) {
+        return;
+    }
+    const int64_t n_exp = any->ne[2];
+
+    // Start the next expert layer's whole stack into the other set. The caller runs after the compute stream
+    // was synchronised, so the layer that last read that set is done with it.
+    const auto look_ahead = [&]() {
+        if (pstage_n_sets_ < 2) {
+            return;
+        }
+        const size_t idx = (size_t) index_[il] + 1;
+        if (idx >= entries_.size()) {
+            return;
+        }
+        const int32_t next = entries_[idx].src.il;
+        const int k2 = pstage_set((uint32_t) next);
+        if (k2 == k) {
+            return;
+        }
+        pstage_wait();
+        pstage_pending_[0] = pstage_pending_[1] = false;
+        std::vector<bells_pstage_op> job;
+        const entry & en = entries_[idx];
+        const layer_src & sn = en.src;
+        ggml_tensor * srcn[4]   = { sn.gate, sn.up, sn.down, sn.gate_up };
+        ggml_tensor * cachen[4] = { en.gate, en.up, en.down, en.gate_up };
+        // The next layer's resident experts come out of the cache in one gather launch, only the others cross
+        // the bus. BELLS_PREFILL_D2D=0 sends everything from the host; =1 copies resident experts one by one,
+        // which is what a backend without the gather would do and measured slower than the host
+        // (1125-token prompt 1.61 s -> 2.06 s).
+        static const char * d2d_env = getenv("BELLS_PREFILL_D2D");
+        static const int d2d_mode = d2d_env ? atoi(d2d_env) : (pstage_gather_ ? 2 : 0);
+        const bool no_d2d = d2d_mode == 0 || (d2d_mode == 2 && !pstage_gather_);
+        for (int i = 0; i < 4; ++i) {
+            ggml_tensor * dst = pstage_t_[k2][i];
+            if (!srcn[i] || !dst) {
+                continue;
+            }
+            const size_t stride = ggml_nbytes(srcn[i])/(size_t) n_exp;
+            const bool use_cache = !no_d2d && next_table && cachen[i] && pstage_view_src_[i] && pstage_view_dst_[i] &&
+                                   (int64_t) next_table->size() >= n_exp && cachen[i]->type == srcn[i]->type &&
+                                   ggml_nbytes(cachen[i])/(size_t) cachen[i]->ne[2] == stride;
+            if (!use_cache) {
+                bells_pstage_op op;
+                op.dst  = dst;
+                op.host = srcn[i]->data;
+                op.size = ggml_nbytes(srcn[i]);
+                job.push_back(op);
+                if (i == 3 || !srcn[3]) {
+                    n_pstage_h2d_ += (uint64_t) n_exp;
+                }
+                continue;
+            }
+            // resident experts come from the cache; each run of the others is one host copy
+            bells_pstage_op gop;
+            if (d2d_mode == 2) {
+                gop.dst   = dst;
+                gop.cache = cachen[i];
+                gop.size  = stride;
+                gop.map.assign((size_t) n_exp, -1);
+            }
+            int64_t run0 = -1;
+            for (int64_t x = 0; x <= n_exp; ++x) {
+                const int32_t slot = x < n_exp ? (*next_table)[x] : -1;
+                const bool resident = x < n_exp && slot >= 0 && (uint32_t) slot < en.n_slot;
+                if (x < n_exp && !resident) {
+                    if (run0 < 0) {
+                        run0 = x;
+                    }
+                    continue;
+                }
+                if (run0 >= 0) {
+                    bells_pstage_op op;
+                    op.dst     = dst;
+                    op.host    = (const char *) srcn[i]->data + (size_t) run0*stride;
+                    op.dst_off = (size_t) run0*stride;
+                    op.size    = (size_t) (x - run0)*stride;
+                    job.push_back(op);
+                    if (i == 3 || !srcn[3]) {
+                        n_pstage_h2d_ += (uint64_t) (x - run0);
+                    }
+                    run0 = -1;
+                }
+                if (resident && d2d_mode == 2) {
+                    gop.map[(size_t) x] = slot;
+                    if (i == 3 || !srcn[3]) {
+                        n_pstage_d2d_++;
+                    }
+                } else if (resident) {
+                    bells_pstage_op op;
+                    op.dst     = dst;
+                    op.cache   = cachen[i];
+                    op.i       = i;
+                    op.dst_off = (size_t) x*stride;
+                    op.src_off = (size_t) slot*stride;
+                    op.size    = stride;
+                    job.push_back(op);
+                    if (i == 3 || !srcn[3]) {
+                        n_pstage_d2d_++;
+                    }
+                }
+            }
+            if (d2d_mode == 2) {
+                job.push_back(std::move(gop));
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(pstage_w_->mu);
+            pstage_w_->job.swap(job);
+            pstage_w_->ready = true;
+        }
+        pstage_w_->cv.notify_all();
+        pstage_pending_[k2] = true;
+        pstage_layer_[k2]   = next;
+    };
+
+    // Already on its way by look-ahead: make the compute stream wait for it, then start the one after.
+    if (pstage_n_sets_ == 2 && pstage_layer_[k] == (int32_t) il) {
+        if (pstage_pending_[k]) {
+            pstage_wait();
+            pstage_pending_[k] = false;
+        }
+        n_pstage_ahead_++;
+        n_pstage_experts_ += (uint64_t) n_exp;
+        n_pstaged_++;
+        look_ahead();
+        return;
+    }
+    // the worker has one stream: whatever it is copying, into either set, has to land before this layer's own copy
+    pstage_wait();
+    pstage_pending_[0] = pstage_pending_[1] = false;
+    // the look-ahead reads the cache from another stream: let the cache's own copies land first
+    if (copy_backend_) {
+        ggml_backend_synchronize(copy_backend_);
+    }
+    const int64_t t_sync0 = ggml_time_us();
+    // a routed-only load is partial: never let a later ubatch take this set for a full copy of the layer
+    pstage_layer_[k] = -1;
+
+    // The experts this ubatch routes to. The rest keep whatever another layer left there, which nothing reads.
+    pstage_used_.assign((size_t) n_exp, experts == nullptr ? 1 : 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (experts[i] >= 0 && experts[i] < n_exp) {
+            pstage_used_[experts[i]] = 1;
+        }
+    }
+    // a gap of one or two unused experts is cheaper to copy than to split the transfer around
+    for (int64_t x = 1; x + 1 < n_exp; ++x) {
+        if (!pstage_used_[x] && pstage_used_[x - 1] && (pstage_used_[x + 1] || (x + 2 < n_exp && pstage_used_[x + 2]))) {
+            pstage_used_[x] = 1;
+        }
+    }
+
+    for (int64_t a = 0; a < n_exp; ) {
+        if (!pstage_used_[a]) {
+            ++a;
+            continue;
+        }
+        int64_t b = a;
+        while (b < n_exp && pstage_used_[b]) {
+            ++b;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (src[i] && pstage_cur[i]) {
+                const size_t stride = ggml_nbytes(src[i])/(size_t) n_exp;
+                ggml_backend_tensor_set(pstage_cur[i], (const char *) src[i]->data + (size_t) a*stride,
+                                        (size_t) a*stride, (size_t) (b - a)*stride);
+            }
+        }
+        n_pstage_experts_ += (uint64_t) (b - a);
+        a = b;
+    }
+    n_pstaged_++;
+    pstage_sync_us_ += (uint64_t) (ggml_time_us() - t_sync0);
+    look_ahead();
+}
+
 void bells_tensors::free() {
     if (copy_backend_) ggml_backend_synchronize(copy_backend_);
     if (backend_) ggml_backend_synchronize(backend_);
+    uint64_t pstage_copy_us = 0;
+    if (pstage_w_) {
+        {
+            std::lock_guard<std::mutex> lock(pstage_w_->mu);
+            pstage_w_->quit = true;
+        }
+        pstage_w_->cv.notify_all();
+        if (pstage_w_->th.joinable()) {
+            pstage_w_->th.join();
+        }
+        pstage_copy_us = pstage_w_->copy_us;
+        pstage_w_.reset();
+    }
+    if (pstage_buf_) {
+        if (pstage_backend_) {
+            ggml_backend_synchronize(pstage_backend_);
+        }
+        if (n_pstaged_ > 0 && !entries_.empty()) {
+            const ggml_tensor * any = pstage_t_[0][3] ? pstage_t_[0][3] : pstage_t_[0][2];
+            const double n_exp = any ? (double) any->ne[2] : 1.0;
+            fprintf(stderr, "bells_tensors: staged %llu layer loads for prompt batches, %.1f%% of their experts copied, "
+                            "%llu arrived by look-ahead (%llu experts from the cache, %llu from the host)\n",
+                    (unsigned long long) n_pstaged_, 100.0*(double) n_pstage_experts_/((double) n_pstaged_*n_exp),
+                    (unsigned long long) n_pstage_ahead_, (unsigned long long) n_pstage_d2d_, (unsigned long long) n_pstage_h2d_);
+            fprintf(stderr, "bells_tensors: staging time: look-ahead copies %.0f ms on their own thread, compute thread waited "
+                            "%.0f ms for them and copied %.0f ms itself\n",
+                    pstage_copy_us/1000.0, pstage_wait_us_/1000.0, pstage_sync_us_/1000.0);
+        }
+        ggml_backend_buffer_free(pstage_buf_);
+        pstage_buf_ = nullptr;
+    }
+    for (auto & ev : pstage_event_) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
+    if (pstage_backend_) {
+        ggml_backend_free(pstage_backend_);
+        pstage_backend_ = nullptr;
+    }
+    if (pstage_ctx_) {
+        ggml_free(pstage_ctx_);
+        pstage_ctx_ = nullptr;
+    }
+    for (auto & set : pstage_t_) {
+        for (auto & t : set) {
+            t = nullptr;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        pstage_view_src_[i] = nullptr;
+        pstage_view_dst_[i] = nullptr;
+    }
     for (auto & e : entries_) {
         if (e.copied) ggml_backend_event_free(e.copied);
         e.copied = nullptr;
@@ -1616,6 +2107,93 @@ const int32_t * bells_conf::predict(int32_t token, uint32_t il, const float ** c
 // runtime
 //
 
+// Reads a profile written by BELLS_LAYER_STATS=<file>: one line per layer, "il c0 c1 ...", the layer's lookups
+// per expert sorted descending. Redistributes n_uniform*layers slots greedily, each next slot going to the layer
+// whose next most-used uncached expert takes the most lookups - the split that maximises covered lookups.
+static void bells_split_slots_by_profile(std::vector<uint32_t> & per_layer_slots, const std::vector<int32_t> & layer_ids,
+                                         uint32_t n_uniform, uint32_t n_expert, uint32_t n_expert_used) {
+    const char * path = getenv("BELLS_LAYER_PROFILE");
+    if (!path || !path[0] || layer_ids.empty() || n_uniform == 0) {
+        return;
+    }
+    std::ifstream in(path);
+    if (!in) {
+        fprintf(stderr, "%s: cannot open '%s', keeping %u slots on every layer\n", __func__, path, n_uniform);
+        return;
+    }
+
+    std::vector<std::vector<double>> freq(per_layer_slots.size());
+    std::string line;
+    while (std::getline(in, line)) {
+        const char * p = line.c_str();
+        char * end = nullptr;
+        const long il = strtol(p, &end, 10);
+        if (end == p || il < 0 || (size_t) il >= freq.size()) {
+            continue;
+        }
+        std::vector<double> c;
+        double tot = 0.0;
+        for (p = end; ; p = end) {
+            const double v = strtod(p, &end);
+            if (end == p) {
+                break;
+            }
+            c.push_back(v);
+            tot += v;
+        }
+        if (tot <= 0.0) {
+            continue;
+        }
+        std::sort(c.begin(), c.end(), [](double a, double b) { return a > b; });
+        for (double & v : c) {
+            v /= tot;
+        }
+        freq[il] = std::move(c);
+    }
+    for (int32_t il : layer_ids) {
+        if (freq[il].empty()) {
+            fprintf(stderr, "%s: '%s' has no row for layer %d, keeping %u slots on every layer\n",
+                    __func__, path, il, n_uniform);
+            return;
+        }
+    }
+
+    // every layer keeps enough for a short verify batch, and no fewer than half its equal share
+    const uint32_t floor_slots = std::min(n_uniform, std::max(8*n_expert_used, n_uniform/2));
+    uint64_t budget = (uint64_t) n_uniform*layer_ids.size();
+    for (int32_t il : layer_ids) {
+        per_layer_slots[il] = floor_slots;
+        budget -= floor_slots;
+    }
+    while (budget > 0) {
+        int32_t best = -1;
+        double  gain = -1.0;
+        for (int32_t il : layer_ids) {
+            const uint32_t k = per_layer_slots[il];
+            if (k >= n_expert) {
+                continue;
+            }
+            const double g = k < freq[il].size() ? freq[il][k] : 0.0;
+            if (g > gain) {
+                gain = g;
+                best = il;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        per_layer_slots[best]++;
+        budget--;
+    }
+
+    uint32_t lo = n_expert, hi = 0;
+    for (int32_t il : layer_ids) {
+        lo = std::min(lo, per_layer_slots[il]);
+        hi = std::max(hi, per_layer_slots[il]);
+    }
+    fprintf(stderr, "%s: profile '%s': %u slots/layer on average, split %u..%u\n", __func__, path, n_uniform, lo, hi);
+}
+
 bool bells_runtime::init(const bells_params & params,
                          ggml_backend_buffer_type_t buft,
                          const std::vector<bells_tensors::layer_src> & srcs_all,
@@ -1788,6 +2366,10 @@ bool bells_runtime::init(const bells_params & params,
                 if (params.vram_reserve_mib > 0) {
                     headroom += (size_t)params.vram_reserve_mib * 1024 * 1024;
                 }
+                // BELLS_PREFILL_STAGE: leave room for one layer's full expert stack
+                if (getenv("BELLS_PREFILL_STAGE") && devices.size() == 1) {
+                    headroom += (size_t) bells_tensors::pstage_sets_wanted()*bells_tensors::pstage_bytes(srcs) + 16ull*1024*1024;
+                }
                 budget   = di.free_bytes > headroom ? di.free_bytes - headroom : 0;
             }
 
@@ -1819,6 +2401,11 @@ bool bells_runtime::init(const bells_params & params,
             for (int32_t il : di.layer_ids) {
                 per_layer_slots[il] = lo;
             }
+
+            // BELLS_LAYER_PROFILE: the same slot total, split by where the lookups go. Layers differ a lot in
+            // how concentrated their routing is (on the 177B, 98% of a layer's lookups take ~200 experts in
+            // some layers and ~390 in others), so equal shares starve the diffuse ones.
+            bells_split_slots_by_profile(per_layer_slots, di.layer_ids, lo, n_expert, n_expert_used);
         }
     }
 
@@ -1892,6 +2479,19 @@ bool bells_runtime::init(const bells_params & params,
     if (!allocated) {
         fprintf(stderr, "%s: failed to allocate expert slots\n", __func__);
         return false;
+    }
+
+    if (getenv("BELLS_PREFILL_STAGE") && params.n_slot == 0 && !params.passive) {
+        if (const char * m = getenv("BELLS_PREFILL_MIN")) {
+            pstage_min_tokens_ = (uint32_t) std::max(1, atoi(m));
+        }
+        if (tensors_.init_pstage(buft)) {
+            fprintf(stderr, "%s: prompt staging on: %d x %.2f GiB (one layer's experts each%s), used for batches of %u+ tokens\n",
+                    __func__, tensors_.pstage_n_sets(), bells_tensors::pstage_bytes(srcs)/1024.0/1024.0/1024.0,
+                    tensors_.pstage_n_sets() == 2 ? ", next layer streamed ahead" : "", pstage_min_tokens_);
+        } else {
+            fprintf(stderr, "%s: prompt staging unavailable (mixed expert layouts, several devices, or no VRAM)\n", __func__);
+        }
     }
 
     // Slot bounds across devices
@@ -2277,12 +2877,18 @@ void bells_runtime::free() {
     gp_wait_us_ = gp_schedule_us_ = 0;
     gp_filtered_ = gp_trials_ = gp_trial_used_ = 0;
 
+    cache_.print_layer_stats();
+
     const uint64_t tot = cache_.n_hit() + cache_.n_miss();
     if (tot > 0) {
         fprintf(stderr, "%s: hit %.1f%% (%llu of %llu), %llu experts copied, %.2f GiB moved\n",
                 __func__, 100.0*cache_.n_hit()/tot,
                 (unsigned long long) cache_.n_hit(), (unsigned long long) tot,
                 (unsigned long long) n_copied_, bytes_moved()/1024.0/1024.0/1024.0);
+        if (n_skipped_ > 0) {
+            fprintf(stderr, "%s: BELLS_SKIP_MISS_RANK left out %llu weak experts (%.2f%% of lookups)\n",
+                    __func__, (unsigned long long) n_skipped_, 100.0*n_skipped_/(tot + n_skipped_));
+        }
     }
 
     // Where the per-layer cost actually goes. readback and upload are paid on every layer of
@@ -2677,7 +3283,8 @@ void bells_runtime::begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens) {
     // drives the --bells-refresh rotation; counted per ubatch, which is per token during decode
     n_tok_seen_++;
 
-    active_now_ = active(n_tokens);
+    active_now_  = active(n_tokens);
+    staging_now_ = staging(n_tokens);
     gp_active_ = gp_enabled_ && active_now_ && n_tokens == 1;
     for (auto & layer : gp_layers_) {
         gp_unused_ += layer.pending.size();
@@ -2783,6 +3390,15 @@ void bells_runtime::begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens) {
 }
 
 bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
+    // a prompt ubatch reads the staged copy: load this layer's whole expert stack before its matmuls run
+    if (ready_ && staging_now_) {
+        if (tensors_.has(il)) {
+            const int32_t next = tensors_.next_layer(il);
+            tensors_.stage_layer(il, experts, n, next >= 0 ? &cache_.slot_table((uint32_t) next) : nullptr);
+        }
+        return true;
+    }
+
     // prefill bypasses the cache in the graph, so it must not touch residency here either
     if (!ready_ || !active_now_) {
         return true;
@@ -2862,6 +3478,32 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     // table, so this is a demand fetch with no lead time to hide it behind.
     const std::vector<uint8_t> * protect =
         (lookahead_ > 0 && il < protect_.size()) ? &protect_[il] : nullptr;
+
+    // BELLS_SKIP_MISS_RANK=K (lossy, off by default): an expert ranked K or lower for its token that is not
+    // resident is not fetched. It stays out of the slot table, so the graph reads the spare zero slot and that
+    // expert contributes nothing to the token. The routing is sorted by weight, so these are the token's
+    // weakest experts, and the copy they would have cost is the dominant price of a miss.
+    static const uint32_t skip_miss_rank = getenv("BELLS_SKIP_MISS_RANK") ? (uint32_t) atoi(getenv("BELLS_SKIP_MISS_RANK")) : 0;
+    // Only for a ubatch of up to 8 tokens: past that the backend sorts tokens by expert (mmq) and assumes a
+    // token names each expert once, which several of its experts sharing the zero slot would break.
+    std::vector<int32_t> kept_ids;
+    if (skip_miss_rank > 0 && skip_miss_rank < n_expert_used_ && split_ids.empty() && n % n_expert_used_ == 0 &&
+            n / n_expert_used_ <= 8) {
+        const std::vector<int32_t> & tbl = cache_.slot_table(il);
+        const size_t k = n_expert_used_;
+        kept_ids.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t e = experts[i];
+            const bool resident = e >= 0 && (size_t) e < tbl.size() && tbl[e] >= 0;
+            if (i % k < skip_miss_rank || resident) {
+                kept_ids.push_back(e);
+            } else {
+                n_skipped_++;
+            }
+        }
+        experts = kept_ids.data();
+        n       = kept_ids.size();
+    }
 
     copies_.clear();
     if (!cache_.ensure(il, experts, n, copies_, protect)) {

@@ -73,6 +73,21 @@ Models streamed from NVMe via mmap. The 177B model (65 GB quantised) doesn't eve
 
 "Without BELLS" means `--cpu-moe -ngl 99` (all attention on GPU, all experts on CPU). The baseline for models that don't fit in VRAM at all is CPU-only, which is far slower.
 
+### Against Strata on a 24 GB card
+
+[Strata](https://github.com/Niko1221/Strata) is a purpose-built engine for Flash-Next 177B. Both engines on one Modal A10G (24 GB), Q2_0 file, 4K context, the two runs of each row taken back to back on the same box:
+
+| | BELLS | Strata |
+|---|---:|---:|
+| Short answers, end to end | 56.3 / 58.7 tok/s | 61.3 / 60.0 tok/s |
+| 600-token answers | 65.5 / 66.0 tok/s | 73.0 / 76.2 tok/s |
+| Reading a ~1.4K-token prompt | 700 tok/s | 959 tok/s |
+| Reading a ~2.7K-token prompt | 854 tok/s | 1,278 tok/s |
+
+BELLS here is the MTP configuration from [Speculative decoding](#speculative-decoding-mtp) with [prompt staging](#long-prompts-prompt-staging) on. Before that work the same comparison stood at 31.6 vs 60.6 tok/s for generation and roughly 200 vs 950 tok/s for prompts. Cloud boxes differ by up to 25% from one job to the next, so only numbers from the same job are comparable.
+
+One caveat on the generation rows: they use a copy of the model with its 240 BF16 dense tensors requantised to Q8_0 (the expert weights are untouched). That is a small precision change whose effect on quality has not been measured yet.
+
 ## Quick start
 
 ### One-flag setup
@@ -139,6 +154,7 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 | `--bells-split K` | Run K of each token's experts on GPU, the rest on CPU concurrently. The MoE output is a weighted sum, so splitting is exact — no quality loss. Fewer experts need to be in the cache. Default: 0 (all through cache). |
 | `--bells-refresh N` | Observe a fixed 1/N subset of MoE layers per token (layers where `il % N == 0`). Unobserved layers use a permanent pinned table, so `--pin-experts` is required. Reduces graph-split overhead (~2.3 ms/token across 32 layers). Default: 1 (every layer). |
 | `--bells-cache-type TYPE` | Store cached experts at a different quantisation than the model (e.g. `q2_K` when the model is `q4_K`). Fits more experts in the same VRAM at the cost of re-quantisation overhead. Experimental. |
+| `--bells-reserve N` | Leave N MiB of VRAM free when auto-sizing the cache. Needed when something else loads onto the GPU after BELLS, such as an MTP draft head (`1536` is a good start, `2200` with prompt staging at `-ub 4096`). |
 | `--bells-passive` | Research only. Allocate the cache and perform graph splits, but don't copy any experts. Measures mechanism overhead in isolation. |
 
 ### Environment variables
@@ -147,6 +163,14 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 |---|---|
 | `GGML_CUDA_NO_PINNED=1` | Disable CUDA pinned (page-locked) host memory allocation. Use this if you see corrupted output or NaN on systems with IOMMU/DMA issues. |
 | `BELLS_ADAPT=N` | Enable adaptive pins: every N decode tokens, decay usage counters and swap the coldest resident experts for the hottest non-resident ones. Keeps the cache aligned with shifting access patterns. Try `BELLS_ADAPT=4`. |
+| `BELLS_PREFILL_STAGE=1` | Prompt staging: read long prompts in large batches instead of cache-sized ones. See [Long prompts](#long-prompts-prompt-staging). |
+| `BELLS_PREFILL_MIN=N` | Smallest batch that takes the staged path (default 192 tokens). Shorter ones go through the cache as usual. |
+| `BELLS_PREFILL_SETS=1` | Use one staging buffer instead of two. Saves one layer's worth of VRAM and gives up copying the next layer ahead. |
+| `BELLS_PREFILL_D2D=0` | Send every staged expert from the host instead of taking the cached ones from VRAM. |
+| `BELLS_LAYER_STATS=file` | Print per-layer miss and coverage numbers at shutdown and save the per-expert lookup counts to `file`. |
+| `BELLS_LAYER_PROFILE=file` | Split the cache's slots between layers according to a file written by `BELLS_LAYER_STATS`, instead of equally. Layers with diffuse routing get more slots. Record the profile on prompts other than the ones you benchmark. |
+| `BELLS_PASS_TIMING=1` | Print wall time per pass by batch size, target and draft contexts apart. Diagnostic; costs a little speed. |
+| `GGML_CUDA_PROFILE=1` | Per-operation GPU time table (needs `GGML_CUDA_DISABLE_GRAPHS=1`). Diagnostic; every operation is synchronised, so it is slow. |
 | `BELLS_GLOBAL_PREFETCH=1` | Enable the online global prefetch predictor. Learns inter-layer routing correlations (`P(expert_to \| expert_from)`) and speculatively copies high-confidence candidates before their layer runs. Requires a GPU with a separate copy stream. Stats printed at shutdown. |
 | `BELLS_GP_AHEAD=N` | How many layers ahead the global predictor looks (default 4, max 8). |
 | `BELLS_GP_CONF=N` | Minimum confidence percentage to issue a prefetch (default 90). |
@@ -197,6 +221,35 @@ llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 --bells-l2-slots 2
 ```
 
 When an expert is evicted from L1 (primary GPU), it goes to L2 (secondary GPU) instead of being discarded. Next time it's needed, it copies from GPU 2 VRAM — a fast device-to-device transfer instead of a page fault from NVMe.
+
+## Speculative decoding (MTP)
+
+Models that ship an MTP draft head (Flash-Next 177B does) can draft a few tokens ahead and verify them in one pass. BELLS works with llama.cpp's `draft-mtp` mode:
+
+```bash
+llama-server -m flash-next-177b-q2_0.gguf --auto --bells-reserve 1536 \
+  -c 4096 -ctk q4_0 -ctv q4_0 -np 1 \
+  --spec-type draft-mtp --spec-draft-model mtp-head-shared.gguf --spec-draft-ngl 99 \
+  --spec-draft-n-max 3 --spec-draft-sampling probabilistic
+```
+
+- Use a *shared* MTP head (one that borrows the embedding and output tensors from the main model). A standalone head loads its own copies and takes the VRAM the expert cache needs.
+- `--bells-reserve` keeps room for the head. Without it the cache is sized first and the head fails to load.
+- Three drafted tokens was the best length measured; four was slower.
+
+## Long prompts (prompt staging)
+
+By default a prompt goes through the expert cache in batches no larger than the cache can serve (about 20 tokens on a 24 GB card with the 177B), which is slow for long prompts. With `BELLS_PREFILL_STAGE=1` a large batch bypasses the cache: each layer's full expert stack is placed in a staging buffer just before that layer runs, and the next layer's is prepared on a second thread while the current one computes. Experts already in the cache are copied inside VRAM; only the others cross the bus.
+
+```bash
+BELLS_PREFILL_STAGE=1 llama-server -m model.gguf --auto --bells-reserve 2200 -ub 4096 -b 4096 ...
+```
+
+- It costs VRAM: two buffers of one layer's experts each (2 x 0.66 GiB on the 177B Q2_0), taken out of the cache.
+- The batch size sets the speed. `-ub 2048` is the default worth trying; `-ub 4096 -b 4096` is faster on prompts longer than 2K tokens and needs more reserve.
+- Batches under 192 tokens, and all generation, still use the cache.
+- On the A10G this took the 177B from about 200 to 700-850 prompt tok/s with generation speed unchanged.
+- CUDA only for the in-VRAM copy; other backends send every expert from the host.
 
 ## How it works
 

@@ -2214,6 +2214,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         bells_gu   = bells->tensors().gate_up(il);
     }
 
+    // A prompt ubatch too wide for the cache: every layer's whole expert stack is staged on the device just
+    // before the layer runs, so the matmuls read it with the original expert ids.
+    if (!bells_ids && bells && bells->staging(n_tokens) && bells->tensors().has(il)) {
+        bells_gate = bells->tensors().pstage_gate(il);
+        bells_up   = bells->tensors().pstage_up(il);
+        bells_down = bells->tensors().pstage_down(il);
+        bells_gu   = bells->tensors().pstage_gate_up(il);
+    }
+
     ggml_tensor * ids_exps = bells_ids ? bells_ids : selected_experts;
 
     // --bells-split: the first K experts of each token on the GPU out of the cache, the remainder

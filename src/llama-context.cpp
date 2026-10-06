@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -776,6 +777,16 @@ llama_context::llama_context(
                              model.hparams.n_expert_used(), backends.front().get(), copy_backend)) {
                 LLAMA_LOG_WARN("%s: BELLS disabled\n", __func__);
                 bells.reset();
+            }
+
+            // A ubatch over the cache's limit runs every expert on the host path, measured at ~80 ms/token
+            // on the 177B against ~15 ms/token through the cache, so split prompts down to what it serves.
+            // With prompt staging the big ubatch stays for long prompts, and decode() picks per batch.
+            if (bells && bells->ready() && !bells->passive() && bells->max_tokens() > 0 &&
+                !bells->tensors().pstage_ready() && cparams.n_ubatch > bells->max_tokens()) {
+                LLAMA_LOG_INFO("%s: BELLS: n_ubatch %u -> %u so prompts stay on the expert cache\n",
+                               __func__, cparams.n_ubatch, bells->max_tokens());
+                cparams.n_ubatch = bells->max_tokens();
             }
 
             // L2 cache on a secondary GPU
@@ -1770,9 +1781,31 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         }
     }
 
+    // While the cache serves this ubatch, read the routing from the contiguous copy that
+    // build_moe_ffn makes for the slot lookup ("ffn_moe_topk-<il> (cont)") instead of from the
+    // topk node. The copy comes after the whole router, so the graph is not cut in the middle of
+    // softmax -> argsort -> get_rows -> norm and the backend can run it as one fused topk-moe op.
+    // BELLS_SPLIT_AT_TOPK=1 restores the cut at the topk node.
+    static const bool split_at_topk = getenv("BELLS_SPLIT_AT_TOPK") != nullptr;
+    if (bells && bells->ready() && bells->active_now() && !split_at_topk) {
+        static const char * csuffix = " (cont)";
+        bool is_cont = t->op == GGML_OP_CONT && t->type == GGML_TYPE_I32 && strncmp(t->name, prefix, plen) == 0;
+        if (is_cont) {
+            const char * s = t->name + plen;
+            const char * d = s;
+            while (*d >= '0' && *d <= '9') {
+                ++d;
+            }
+            is_cont = d != s && strcmp(d, csuffix) == 0;
+        }
+        is_topk = is_cont;
+    }
+
     // Do not split the graph during prefill. BELLS cannot serve a prefill ubatch, so the routing
     // read there is discarded - the splits were pure overhead, worth ~17% of prefill throughput.
-    if (is_topk && bells && bells->ready() && !bells->active_now()) {
+    // The one exception is prompt staging: it needs the cut at every layer, to load that layer's experts.
+    const bool staging = bells && bells->ready() && bells->staging_now();
+    if (is_topk && bells && bells->ready() && !bells->active_now() && !staging) {
         is_topk = false;
     }
 
@@ -1781,7 +1814,7 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
     // not the readback, is the dominant cost of the mechanism.
     if (is_topk && bells && bells->ready()) {
         const int il_ask = atoi(t->name + plen);
-        if (il_ask >= 0 && !bells->should_observe((uint32_t) il_ask)) {
+        if (il_ask >= 0 && !staging && !bells->should_observe((uint32_t) il_ask)) {
             is_topk = false;
         }
     }
@@ -2027,6 +2060,8 @@ static bool llama_bells_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t t_pass_start_us = ggml_time_us();
+
     if (bells && bells->ready()) {
         bells->begin_ubatch(ubatch.token && ubatch.n_tokens > 0 ? ubatch.token[0] : -1,
                             ubatch.pos   && ubatch.n_tokens > 0 ? (int32_t) ubatch.pos[0] : -1,
@@ -2107,6 +2142,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    // BELLS_PASS_TIMING=1: wall time of a whole pass by ubatch size, target and draft contexts apart. It waits
+    // for the backend before stopping the clock, so it costs a little pipelining; use it to compare, not to bench.
+    static const bool pass_timing = getenv("BELLS_PASS_TIMING") != nullptr;
+    if (pass_timing) {
+        ggml_backend_sched_synchronize(sched.get());
+        struct acc { uint64_t n = 0; uint64_t us = 0; };
+        static std::map<std::pair<int, uint32_t>, acc> stats;
+        static uint64_t n_total = 0;
+        const int kind = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0;
+        auto & a = stats[{ kind, std::min<uint32_t>(ubatch.n_tokens, 9) }];
+        a.n  += 1;
+        a.us += (uint64_t) (ggml_time_us() - t_pass_start_us);
+        if (ubatch.n_tokens >= 64) {
+            uint64_t copy_us = 0, wait_us = 0, sync_us = 0;
+            if (bells) {
+                bells->tensors().pstage_times(copy_us, wait_us, sync_us);
+            }
+            static uint64_t last[3] = { 0, 0, 0 };
+            fprintf(stderr, "bells_pass: big n=%u took %.0f ms; staging: look-ahead thread %.0f ms, compute thread waited %.0f ms "
+                            "and copied %.0f ms itself\n",
+                    ubatch.n_tokens, (ggml_time_us() - t_pass_start_us)/1000.0,
+                    (copy_us - last[0])/1000.0, (wait_us - last[1])/1000.0, (sync_us - last[2])/1000.0);
+            last[0] = copy_us;
+            last[1] = wait_us;
+            last[2] = sync_us;
+        }
+        if (++n_total % 1000 == 0) {
+            for (const auto & [key, v] : stats) {
+                fprintf(stderr, "bells_pass: %s n=%u%s passes %8llu  %7.2f ms/pass\n",
+                        key.first ? "draft " : "target", key.second, key.second == 9 ? "+" : " ",
+                        (unsigned long long) v.n, v.us/1000.0/v.n);
+            }
+        }
+    }
 
     return res;
 }
@@ -2452,7 +2522,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        // BELLS with prompt staging: a long batch goes through in full ubatches against the staged experts,
+        // a short one in cache-sized ubatches, which is cheaper than staging every layer for a few tokens.
+        uint32_t n_ubatch_eff = cparams.n_ubatch;
+        if (bells && bells->ready() && !bells->passive() && bells->tensors().pstage_ready() &&
+                bells->max_tokens() > 0 && n_tokens_all < bells->pstage_min_tokens()) {
+            n_ubatch_eff = std::min(n_ubatch_eff, bells->max_tokens());
+        }
+        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
         if (!mctx) {
             return -2;
         }

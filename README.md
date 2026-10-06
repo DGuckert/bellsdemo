@@ -22,7 +22,7 @@ iex (irm https://raw.githubusercontent.com/DGuckert/llama.cpp-BELLS/bells-next/i
 
 The installer automatically:
 1. Detects your GPU (NVIDIA/AMD/Intel) and available SDKs (CUDA, Vulkan)
-2. Downloads precompiled binaries if available, otherwise builds from source
+2. Downloads precompiled binaries (Windows and Linux x86-64, CUDA or Vulkan) if they run on your machine, otherwise builds from source
 3. Installs the `bells` command to your PATH
 
 After installation, run `bells system` to verify your setup.

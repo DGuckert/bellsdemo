@@ -41,9 +41,13 @@ if [ ! -f "$REPO_DIR/tools/bells-manager/install.py" ]; then
     REPO_DIR="$HOME/llama.cpp-BELLS"
     if [ ! -d "$REPO_DIR" ]; then
         echo "[BELLS] Cloning repository..."
-        git clone https://github.com/DGuckert/llama.cpp-BELLS.git "$REPO_DIR"
+        git clone --branch bells-next https://github.com/DGuckert/llama.cpp-BELLS.git "$REPO_DIR"
     else
-        echo "[BELLS] Repository already exists at $REPO_DIR"
+        echo "[BELLS] Updating repository at $REPO_DIR..."
+        # stays on whatever is there if the tree has local changes
+        git -C "$REPO_DIR" fetch origin bells-next >/dev/null 2>&1 || true
+        git -C "$REPO_DIR" checkout bells-next >/dev/null 2>&1 || true
+        git -C "$REPO_DIR" merge --ff-only origin/bells-next >/dev/null 2>&1 || true
     fi
 fi
 

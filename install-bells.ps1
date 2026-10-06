@@ -51,7 +51,7 @@ if (-not $repoDir) {
     $repoDir = Join-Path $env:USERPROFILE "llama.cpp-BELLS"
     if (-not (Test-Path $repoDir)) {
         Write-Host "[BELLS] Cloning repository..." -ForegroundColor Yellow
-        git clone https://github.com/DGuckert/llama.cpp-BELLS.git $repoDir
+        git clone --branch bells-next https://github.com/DGuckert/llama.cpp-BELLS.git $repoDir
         if ($LASTEXITCODE -ne 0) {
             Write-Host "[BELLS] Git clone failed. Install git: https://git-scm.com" -ForegroundColor Red
             exit 1
@@ -59,8 +59,8 @@ if (-not $repoDir) {
     } else {
         Write-Host "[BELLS] Updating repository at $repoDir..." -ForegroundColor Yellow
         try { git -C $repoDir fetch origin 2>&1 | Out-Null } catch {}
-        try { git -C $repoDir checkout master 2>&1 | Out-Null } catch {}
-        try { git -C $repoDir reset --hard origin/master 2>&1 | Out-Null } catch {}
+        try { git -C $repoDir checkout bells-next 2>&1 | Out-Null } catch {}
+        try { git -C $repoDir reset --hard origin/bells-next 2>&1 | Out-Null } catch {}
     }
 }
 

@@ -197,6 +197,8 @@ def find_binaries(search_paths: Optional[list[str]] = None) -> dict[str, Path]:
     if search_paths is None:
         search_paths = []
         base = Path(__file__).resolve().parent.parent.parent
+        # downloaded release binaries first, then local builds
+        search_paths.append(str(base / "bin"))
         for d in base.glob("build*/bin/Release"):
             search_paths.append(str(d))
         for d in base.glob("build*/bin"):

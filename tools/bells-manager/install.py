@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """BELLS installer — detects GPU, builds from source or downloads precompiled binaries."""
 
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -81,57 +83,121 @@ def install_python_deps():
     run([sys.executable, "-m", "pip", "install", "--quiet"] + deps, check=False)
 
 
-def try_precompiled(vendor: str, has_cuda: bool) -> bool:
-    """Try to download precompiled binaries from GitHub releases."""
-    if platform.system() != "Windows":
-        return False
+RELEASES_API = "https://api.github.com/repos/DGuckert/llama.cpp-BELLS/releases/latest"
+MARKER = ".bells-release"
 
-    if vendor == "nvidia" and has_cuda:
-        asset = "bells-win-cuda-vulkan.zip"
-    else:
-        asset = "bells-win-vulkan.zip"
 
-    log(f"Trying precompiled binary: {asset}")
+def bin_dir() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "bin"
 
+
+def server_binary() -> Path:
+    return bin_dir() / ("llama-server.exe" if platform.system() == "Windows" else "llama-server")
+
+
+def latest_release() -> dict:
+    """The latest GitHub release, or {} when it cannot be read."""
     try:
-        releases_url = f"https://api.github.com/repos/DGuckert/llama.cpp-BELLS/releases/latest"
-        req = urllib.request.Request(releases_url)
+        req = urllib.request.Request(RELEASES_API)
         req.add_header("Accept", "application/vnd.github.v3+json")
         with urllib.request.urlopen(req, timeout=15) as resp:
-            import json
-            data = json.loads(resp.read())
-
-        download_url = None
-        for a in data.get("assets", []):
-            if a["name"] == asset:
-                download_url = a["browser_download_url"]
-                break
-
-        if not download_url:
-            log(f"  Asset {asset} not found in latest release")
-            return False
-
-        dest_dir = Path(__file__).resolve().parent.parent.parent / "bin"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = dest_dir / asset
-
-        log(f"  Downloading {download_url}...")
-        urllib.request.urlretrieve(download_url, zip_path)
-
-        log(f"  Extracting to {dest_dir}...")
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(dest_dir)
-        zip_path.unlink()
-
-        exes = list(dest_dir.glob("*.exe"))
-        if exes:
-            log(f"  Installed {len(exes)} executables to {dest_dir}")
-            return True
-        return False
-
+            return json.loads(resp.read())
     except Exception as e:
-        log(f"  Download failed: {e}")
+        log(f"  Could not read the latest release: {e}")
+        return {}
+
+
+def installed_release() -> str:
+    try:
+        return (bin_dir() / MARKER).read_text().strip()
+    except OSError:
+        return ""
+
+
+def precompiled_assets(vendor: str, has_cuda: bool) -> list[str]:
+    """Release assets worth trying on this machine, best first."""
+    system = platform.system()
+    machine = platform.machine().lower()
+    if machine not in ("x86_64", "amd64"):
+        return []
+    if system == "Windows":
+        # the CUDA build needs the CUDA runtime DLLs, which come with the toolkit
+        if vendor == "nvidia" and has_cuda:
+            return ["bells-win-cuda-vulkan.zip", "bells-win-vulkan.zip"]
+        return ["bells-win-vulkan.zip"]
+    if system == "Linux":
+        if vendor == "nvidia":
+            return ["bells-linux-cuda.tar.gz", "bells-linux-vulkan.tar.gz"]
+        return ["bells-linux-vulkan.tar.gz"]
+    return []
+
+
+def binaries_run() -> bool:
+    """True when the installed llama-server starts, i.e. its shared libraries all resolve."""
+    exe = server_binary()
+    if not exe.is_file():
         return False
+    try:
+        r = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def clear_bin():
+    d = bin_dir()
+    if not d.exists():
+        return
+    for f in d.iterdir():
+        if f.is_file() or f.is_symlink():
+            f.unlink()
+
+
+def try_precompiled(vendor: str, has_cuda: bool, release: dict | None = None) -> bool:
+    """Try to download precompiled binaries from the latest GitHub release."""
+    assets = precompiled_assets(vendor, has_cuda)
+    if not assets:
+        return False
+
+    data = release if release else latest_release()
+    urls = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
+    dest_dir = bin_dir()
+    touched = False
+
+    for asset in assets:
+        log(f"Trying precompiled binary: {asset}")
+        if asset not in urls:
+            log(f"  Asset {asset} not found in latest release")
+            continue
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            touched = True
+            clear_bin()
+            archive = dest_dir / asset
+
+            log(f"  Downloading {urls[asset]}...")
+            urllib.request.urlretrieve(urls[asset], archive)
+
+            log(f"  Extracting to {dest_dir}...")
+            if asset.endswith(".zip"):
+                with zipfile.ZipFile(archive, "r") as zf:
+                    zf.extractall(dest_dir)
+            else:
+                with tarfile.open(archive, "r:gz") as tf:
+                    tf.extractall(dest_dir)
+            archive.unlink()
+
+            if binaries_run():
+                (dest_dir / MARKER).write_text(data.get("tag_name", "") + "\n")
+                log(f"  Installed {data.get('tag_name', 'release')} to {dest_dir}")
+                return True
+            log(f"  {asset} does not start on this machine (missing GPU runtime libraries?)")
+        except Exception as e:
+            log(f"  Download failed: {e}")
+
+    if touched:
+        clear_bin()
+    return False
 
 
 def build_from_source(vendor: str, has_cuda: bool, has_vulkan: bool) -> bool:
@@ -252,20 +318,30 @@ def main():
     print()
 
     repo_dir = Path(__file__).resolve().parent.parent.parent
-    bins_exist = any((repo_dir / "bin").glob("*.exe")) if (repo_dir / "bin").exists() else False
+    built = bool(list(repo_dir.glob("build*/bin/Release/llama-server*")) or list(repo_dir.glob("build*/bin/llama-server*")))
+    downloaded = server_binary().is_file()
 
-    if not bins_exist:
-        build_dirs = list(repo_dir.glob("build*/bin/Release/llama-server*"))
-        bins_exist = bool(build_dirs)
+    release = {}
+    if downloaded:
+        # downloaded binaries follow the releases; a copy with no marker predates them
+        release = latest_release()
+        latest = release.get("tag_name", "")
+        if latest and installed_release() != latest:
+            log(f"Updating binaries to {latest}...")
+            if not try_precompiled(vendor, has_cuda, release):
+                log("Update not available for this machine.")
+                downloaded = False
+        else:
+            log("Binaries are up to date.")
 
-    if not bins_exist:
+    if not downloaded and not built:
         log("No binaries found. Attempting to get them...")
-        if not try_precompiled(vendor, has_cuda):
+        if not try_precompiled(vendor, has_cuda, release):
             log("Precompiled not available, building from source...")
             if not build_from_source(vendor, has_cuda, has_vulkan):
                 error("Build failed. Check the output above for errors.")
-    else:
-        log("Binaries already present, skipping build.")
+    elif not downloaded:
+        log("Using the binaries built from source.")
 
     print()
     create_shortcut()

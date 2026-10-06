@@ -29,6 +29,23 @@
 // topk is the authoritative selection but is a non-contiguous view, and archs that pass a
 // precomputed selection never emit an argsort node. Tally both, prefer topk.
 
+// llama_batch helpers; common no longer provides them for the plain batch
+static void common_batch_clear(llama_batch & batch) {
+    batch.n_tokens = 0;
+}
+
+static void common_batch_add(llama_batch & batch, llama_token id, llama_pos pos,
+                             const std::vector<llama_seq_id> & seq_ids, bool logits) {
+    batch.token   [batch.n_tokens] = id;
+    batch.pos     [batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = (int32_t) seq_ids.size();
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
+    }
+    batch.logits  [batch.n_tokens] = logits;
+    batch.n_tokens++;
+}
+
 static const double BELLS_CACHE_FRACTIONS[] = { 0.125, 0.25, 0.50, 0.75 };
 static const size_t BELLS_N_CACHE = sizeof(BELLS_CACHE_FRACTIONS)/sizeof(BELLS_CACHE_FRACTIONS[0]);
 

@@ -27,7 +27,12 @@ def error(msg: str):
 
 def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     log(f"  $ {' '.join(cmd)}")
-    return subprocess.run(cmd, **kwargs)
+    result = subprocess.run(cmd, **kwargs)
+    # Correctly detect subprocess failures: callers that need to handle
+    # errors check returncode; callers that want to abort pass check=True
+    # which raises CalledProcessError. Never silently ignore a non-zero
+    # returncode when check=True is not set — the caller must inspect it.
+    return result
 
 
 def check_python():
@@ -80,7 +85,13 @@ def detect_gpu() -> tuple[str, bool, bool]:
 def install_python_deps():
     log("Installing Python dependencies...")
     deps = ["textual>=0.40.0", "huggingface_hub"]
-    run([sys.executable, "-m", "pip", "install", "--quiet"] + deps, check=False)
+    # Propagate failures: a broken pip install must not be silently ignored.
+    result = run([sys.executable, "-m", "pip", "install", "--quiet"] + deps, check=False)
+    if result.returncode != 0:
+        log(f"  pip install failed with exit code {result.returncode} — continuing anyway (offline?)")
+        # Do not abort the whole installer for missing Python deps; bench and
+        # manager will fail later with a clear message. But the failure is now
+        # visible and not silently swallowed.
 
 
 RELEASES_API = "https://api.github.com/repos/DGuckert/llama.cpp-BELLS/releases/latest"
@@ -144,13 +155,121 @@ def binaries_run() -> bool:
         return False
 
 
+def _is_safe_path(base: Path, target: Path) -> bool:
+    """True if target is inside base (prevents path traversal)."""
+    try:
+        base_resolved = base.resolve()
+        target_resolved = (base / target).resolve()
+        return str(target_resolved).startswith(str(base_resolved) + os.sep) or target_resolved == base_resolved
+    except Exception:
+        return False
+
+
+def _is_safe_zip_info(info: zipfile.ZipInfo) -> bool:
+    """Reject unsafe zip entries: absolute paths, traversal, symlinks, devices."""
+    name = info.filename
+    # Reject absolute paths and traversal
+    if name.startswith("/") or name.startswith("\\"):
+        return False
+    if ".." in Path(name).parts:
+        return False
+    # zipfile exposes external_attr; check symlink bit (0xA000)
+    # and directory traversal already handled; reject symlinks
+    is_symlink = (info.external_attr >> 16) & 0o170000 == 0o120000
+    if is_symlink:
+        return False
+    # Reject excessively large entries to avoid zip bombs (warn, not abort)
+    # 2 GiB per file is a reasonable upper bound for binaries
+    if info.file_size > 2 * 1024 * 1024 * 1024:
+        return False
+    return True
+
+
+def safe_extract_zip(zip_path: Path, dest_dir: Path):
+    """Safely extract a zip file, rejecting traversal and unsafe entries."""
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            if not _is_safe_zip_info(info):
+                log(f"  Skipping unsafe zip entry: {info.filename}")
+                continue
+            # Extra check: resolved path must stay inside dest_dir
+            target = dest_dir / info.filename
+            if not _is_safe_path(dest_dir, Path(info.filename)):
+                log(f"  Skipping traversal zip entry: {info.filename}")
+                continue
+            zf.extract(info, dest_dir)
+
+
+def _is_safe_tar_info(member: tarfile.TarInfo) -> bool:
+    """Reject unsafe tar entries: absolute paths, traversal, symlinks outside, devices."""
+    name = member.name
+    if name.startswith("/") or name.startswith("\\"):
+        return False
+    if ".." in Path(name).parts:
+        return False
+    # Reject special file types: character/block devices, FIFOs
+    if member.ischr() or member.isblk() or member.isfifo() or member.isdev():
+        return False
+    # Symlinks/hardlinks must not escape destination: check link target
+    if member.issym() or member.islnk():
+        # linkname must also be safe and not absolute/traversal
+        if member.linkname.startswith("/") or ".." in Path(member.linkname).parts:
+            return False
+    return True
+
+
+def safe_extract_tar(tar_path: Path, dest_dir: Path):
+    """Safely extract a tar.gz file, rejecting traversal and unsafe entries."""
+    with tarfile.open(tar_path, "r:gz") as tf:
+        members = tf.getmembers()
+        safe_members = []
+        for m in members:
+            if not _is_safe_tar_info(m):
+                log(f"  Skipping unsafe tar entry: {m.name}")
+                continue
+            target = dest_dir / m.name
+            if not _is_safe_path(dest_dir, Path(m.name)):
+                log(f"  Skipping traversal tar entry: {m.name}")
+                continue
+            # For symlinks, also validate the resolved link target stays inside
+            if m.issym() or m.islnk():
+                link_target = (target.parent / m.linkname).resolve()
+                try:
+                    if not str(link_target).startswith(str(dest_dir.resolve()) + os.sep):
+                        log(f"  Skipping symlink escaping dest: {m.name} -> {m.linkname}")
+                        continue
+                except Exception:
+                    continue
+            safe_members.append(m)
+        # Use filter='data' on Python 3.12+ for extra safety if available
+        try:
+            tf.extractall(dest_dir, members=safe_members, filter='data')
+        except TypeError:
+            tf.extractall(dest_dir, members=safe_members)
+
+
 def clear_bin():
+    """Remove only BELLS-managed binaries, preserving user files.
+
+    Previously this deleted every file in bin/, destroying user data on
+    failed installs. Now it only removes known BELLS outputs and the marker.
+    """
     d = bin_dir()
     if not d.exists():
         return
+    # Known BELLS binaries and artifacts to clean before fresh install.
+    # Preserve any other user files (models, configs, etc.).
+    managed_prefixes = ("llama-", "bells", "ggml", "libggml", "libbells")
+    managed_names = {".bells-release", "bells.bat", "bells.sh"}
     for f in d.iterdir():
         if f.is_file() or f.is_symlink():
-            f.unlink()
+            name_lower = f.name.lower()
+            if name_lower in managed_names or any(name_lower.startswith(p) for p in managed_prefixes):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            # else: preserve user file
 
 
 def try_precompiled(vendor: str, has_cuda: bool, release: dict | None = None) -> bool:
@@ -162,41 +281,47 @@ def try_precompiled(vendor: str, has_cuda: bool, release: dict | None = None) ->
     data = release if release else latest_release()
     urls = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
     dest_dir = bin_dir()
-    touched = False
 
     for asset in assets:
         log(f"Trying precompiled binary: {asset}")
         if asset not in urls:
             log(f"  Asset {asset} not found in latest release")
             continue
+        archive = None
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            touched = True
-            clear_bin()
             archive = dest_dir / asset
 
             log(f"  Downloading {urls[asset]}...")
             urllib.request.urlretrieve(urls[asset], archive)
 
             log(f"  Extracting to {dest_dir}...")
+            # Clear only managed files, preserving user data
+            clear_bin()
             if asset.endswith(".zip"):
-                with zipfile.ZipFile(archive, "r") as zf:
-                    zf.extractall(dest_dir)
+                safe_extract_zip(archive, dest_dir)
             else:
-                with tarfile.open(archive, "r:gz") as tf:
-                    tf.extractall(dest_dir)
+                safe_extract_tar(archive, dest_dir)
             archive.unlink()
+            archive = None
 
             if binaries_run():
                 (dest_dir / MARKER).write_text(data.get("tag_name", "") + "\n")
                 log(f"  Installed {data.get('tag_name', 'release')} to {dest_dir}")
                 return True
             log(f"  {asset} does not start on this machine (missing GPU runtime libraries?)")
+            # Don't leave a broken half-extract on failure — clean managed files only
+            clear_bin()
         except Exception as e:
             log(f"  Download failed: {e}")
+            if archive and archive.exists():
+                try:
+                    archive.unlink()
+                except OSError:
+                    pass
+            # On failure, clean only managed files, not user data.
+            # Do not call clear_bin() again with touched logic that would wipe user files.
 
-    if touched:
-        clear_bin()
     return False
 
 
@@ -206,7 +331,10 @@ def build_from_source(vendor: str, has_cuda: bool, has_vulkan: bool) -> bool:
 
     if not (repo_dir / "CMakeLists.txt").exists():
         log(f"Cloning repository to {repo_dir}...")
-        run(["git", "clone", REPO, str(repo_dir)], check=True)
+        result = run(["git", "clone", REPO, str(repo_dir)], check=False)
+        if result.returncode != 0:
+            log(f"  git clone failed with exit code {result.returncode}")
+            return False
 
     if not shutil.which("cmake"):
         error("cmake not found. Install CMake: https://cmake.org/download/")
@@ -229,12 +357,16 @@ def build_from_source(vendor: str, has_cuda: bool, has_vulkan: bool) -> bool:
     log("Configuring...")
     r = run(["cmake"] + cmake_args, cwd=str(repo_dir))
     if r.returncode != 0:
+        log(f"  cmake configure failed with exit code {r.returncode}")
         return False
 
     log("Building (this may take a while)...")
     r = run(["cmake", "--build", str(build_dir), "--config", "Release",
              "-j", str(os.cpu_count() or 4)], cwd=str(repo_dir))
-    return r.returncode == 0
+    if r.returncode != 0:
+        log(f"  build failed with exit code {r.returncode}")
+        return False
+    return True
 
 
 def create_shortcut():
@@ -283,17 +415,23 @@ def _add_to_path_windows(dir_path: str):
             capture_output=True, text=True, timeout=10,
         )
         user_path = result.stdout.strip()
+        if result.returncode != 0:
+            log(f"  Could not read user PATH: {result.stderr.strip()}")
+            return
 
         if dir_path.lower() in user_path.lower():
             log(f"  Already on PATH: {dir_path}")
             return
 
         new_path = f"{user_path};{dir_path}" if user_path else dir_path
-        subprocess.run(
+        result = subprocess.run(
             ["powershell", "-Command",
              f"[Environment]::SetEnvironmentVariable('PATH', '{new_path}', 'User')"],
             capture_output=True, text=True, timeout=10,
         )
+        if result.returncode != 0:
+            log(f"  Could not update user PATH: {result.stderr.strip()}")
+            return
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + dir_path
         log(f"  Added to user PATH: {dir_path}")
         log(f"  Restart your terminal for 'bells' to work everywhere")
@@ -330,7 +468,10 @@ def main():
             log(f"Updating binaries to {latest}...")
             if not try_precompiled(vendor, has_cuda, release):
                 log("Update not available for this machine.")
-                downloaded = False
+                # Preserve existing binaries — don't mark as not downloaded.
+                # Previously this set downloaded=False which forced a rebuild
+                # even though the old binaries were still valid.
+                pass
         else:
             log("Binaries are up to date.")
 

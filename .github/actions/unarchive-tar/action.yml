@@ -22,6 +22,51 @@ runs:
     - name: Unarchive into directory
       shell: bash
       run: |
-        mkdir -p ${{ inputs.path }}
-        cd ${{ inputs.path }}
-        curl --no-progress-meter -L ${{ inputs.url }} | tar -${{ inputs.type }}x --strip-components=${{ inputs.strip }}
+        set -euo pipefail
+        mkdir -p "${{ inputs.path }}"
+        TMPFILE=$(mktemp)
+        trap 'rm -f "$TMPFILE"' EXIT
+        curl --no-progress-meter -L "${{ inputs.url }}" -o "$TMPFILE"
+
+        # Validate archive members before extracting: reject absolute paths,
+        # path traversal (..), and unsafe file types (devices, FIFOs).
+        echo "Validating archive..."
+        if ! tar -t${{ inputs.type }}f "$TMPFILE" > /dev/null; then
+          echo "ERROR: archive is not a valid tar file"
+          exit 1
+        fi
+
+        # Check for unsafe entries
+        UNSAFE=$(tar -t${{ inputs.type }}f "$TMPFILE" 2>/dev/null | while IFS= read -r entry; do
+          # Absolute paths
+          if [[ "$entry" = /* ]]; then
+            echo "absolute path: $entry"
+            continue
+          fi
+          # Path traversal
+          if [[ "$entry" == *".."* ]]; then
+            echo "traversal: $entry"
+            continue
+          fi
+        done)
+
+        if [ -n "$UNSAFE" ]; then
+          echo "ERROR: archive contains unsafe entries:"
+          echo "$UNSAFE"
+          exit 1
+        fi
+
+        # Check for device files, FIFOs etc. before extracting
+        if tar -tv${{ inputs.type }}f "$TMPFILE" 2>/dev/null | grep -qE '^[^ ]*[cbp]'; then
+          echo "ERROR: archive contains device files or FIFOs"
+          exit 1
+        fi
+
+        echo "Extracting archive safely..."
+        cd "${{ inputs.path }}"
+        # Use --no-same-owner where supported (GNU tar), ignore error on BSD tar
+        tar -${{ inputs.type }}x --strip-components=${{ inputs.strip }} -f "$TMPFILE" --no-same-owner 2>/dev/null || \
+          tar -${{ inputs.type }}x --strip-components=${{ inputs.strip }} -f "$TMPFILE"
+
+        rm -f "$TMPFILE"
+        trap - EXIT

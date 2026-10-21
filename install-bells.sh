@@ -7,7 +7,7 @@ set -e
 echo ""
 echo "  ____  _____ _     _     ____"
 echo " | __ )| ____| |   | |   / ___|"
-echo " |  _ \|  _| | |   | |   \___ \\"
+echo " |  _ \\|  _| | |   | |   \\___ \\"
 echo " | |_) | |___| |___| |___ ___) |"
 echo " |____/|_____|_____|_____|____/"
 echo ""
@@ -41,18 +41,37 @@ if [ ! -f "$REPO_DIR/tools/bells-manager/install.py" ]; then
     REPO_DIR="$HOME/llama.cpp-BELLS"
     if [ ! -d "$REPO_DIR" ]; then
         echo "[BELLS] Cloning repository..."
-        git clone --branch bells-next https://github.com/DGuckert/llama.cpp-BELLS.git "$REPO_DIR"
+        if ! git clone --branch bells-next https://github.com/DGuckert/llama.cpp-BELLS.git "$REPO_DIR"; then
+            echo "[BELLS] ERROR: git clone failed"
+            exit 1
+        fi
     else
         echo "[BELLS] Updating repository at $REPO_DIR..."
-        # stays on whatever is there if the tree has local changes
-        git -C "$REPO_DIR" fetch origin bells-next >/dev/null 2>&1 || true
-        git -C "$REPO_DIR" checkout bells-next >/dev/null 2>&1 || true
-        git -C "$REPO_DIR" merge --ff-only origin/bells-next >/dev/null 2>&1 || true
+        # Preserve local changes: check for dirty worktree before touching it.
+        if ! git -C "$REPO_DIR" diff --quiet --ignore-submodules 2>/dev/null || ! git -C "$REPO_DIR" diff --cached --quiet --ignore-submodules 2>/dev/null; then
+            echo "[BELLS] Local changes detected — skipping git update to preserve them."
+            echo "[BELLS] Commit or stash your changes, then re-run the installer to update."
+        else
+            # Fetch and fast-forward only; fail loudly if it cannot be done.
+            if git -C "$REPO_DIR" fetch origin bells-next; then
+                if ! git -C "$REPO_DIR" checkout bells-next; then
+                    echo "[BELLS] WARNING: could not checkout bells-next, keeping current branch"
+                elif ! git -C "$REPO_DIR" merge --ff-only origin/bells-next; then
+                    echo "[BELLS] WARNING: could not fast-forward — local commits or diverged history, keeping current state"
+                    echo "[BELLS] Preserve your work and run: git -C \"$REPO_DIR\" merge --ff-only origin/bells-next"
+                fi
+            else
+                echo "[BELLS] WARNING: git fetch failed — keeping current checkout"
+            fi
+        fi
     fi
 fi
 
 echo "[BELLS] Running installer..."
-"$PY" "$REPO_DIR/tools/bells-manager/install.py"
+if ! "$PY" "$REPO_DIR/tools/bells-manager/install.py"; then
+    echo "[BELLS] ERROR: installer failed"
+    exit 1
+fi
 
 echo ""
 echo "[BELLS] Done! Run 'bells' to start."

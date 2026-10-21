@@ -157,12 +157,24 @@ class ServerScreen(Screen):
         self._log(f"[bold]Starting server...[/]")
 
         try:
+            popen_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "bufsize": 1,
+                "env": {**os.environ, "GGML_CUDA_NO_PINNED": "1"},
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                try:
+                    popen_kwargs["start_new_session"] = True
+                except Exception:
+                    pass
+
             self.process = subprocess.Popen(
                 [self.server_path] + self.server_args,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-                env={**os.environ, "GGML_CUDA_NO_PINNED": "1"},
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                **popen_kwargs,
             )
         except Exception as e:
             self._log(f"[red]Failed to start: {e}[/]")
@@ -214,9 +226,20 @@ class ServerScreen(Screen):
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._log("[red]Force killing...[/]")
-            self.process.kill()
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+            try:
+                self.process.wait(timeout=5)
+            except Exception:
+                pass
         except Exception as e:
             self._log(f"[red]Error stopping: {e}[/]")
+            try:
+                self.process.kill()
+            except Exception:
+                pass
 
     def _open_browser(self) -> None:
         port = "8080"

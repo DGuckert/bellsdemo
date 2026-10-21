@@ -366,6 +366,33 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
 
     layer & l = layers_[il];
 
+    // Make ensure() atomic: on failure (too many distinct experts for the
+    // cache) leave all residency bookkeeping exactly as it was before the
+    // call, so a failed check cannot corrupt the cache state.
+
+    // Snapshot everything this call may mutate so we can roll back on failure.
+    const std::vector<int32_t> snap_expert_slot = l.expert_slot;
+    const std::vector<int32_t> snap_slot_expert = l.slot_expert;
+    const std::vector<int64_t> snap_last_used   = l.last_used;
+    const std::vector<float>   snap_usage       = l.usage;
+    const int64_t snap_clock = clock_;
+    const uint64_t snap_n_hit  = n_hit_;
+    const uint64_t snap_n_miss = n_miss_;
+    const uint64_t snap_layer_look = layer_stats_ ? layer_look_[il] : 0;
+    const uint64_t snap_layer_miss = layer_stats_ ? layer_miss_[il] : 0;
+    // layer_count is per-expert, save only the experts in this request that will be mutated
+    std::vector<std::pair<int32_t,uint32_t>> snap_counts;
+    snap_counts.reserve(n);
+    if (layer_stats_) {
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t e = experts[i];
+            if (e >= 0 && (uint32_t)e < n_expert_) {
+                snap_counts.emplace_back(e, layer_count_[il][e]);
+            }
+        }
+    }
+    const size_t out_start = out.size();
+
     clock_++;
 
     for (size_t i = 0; i < n; ++i) {
@@ -394,7 +421,22 @@ bool bells_cache::ensure(uint32_t il, const int32_t * experts, size_t n,
 
         const int32_t s = victim(l, n_slot_per_layer_[il], experts, n, protect);
         if (s < 0) {
-            // more distinct experts requested than the cache can hold
+            // more distinct experts requested than the cache can hold - roll back
+            l.expert_slot = snap_expert_slot;
+            l.slot_expert = snap_slot_expert;
+            l.last_used   = snap_last_used;
+            l.usage       = snap_usage;
+            clock_  = snap_clock;
+            n_hit_  = snap_n_hit;
+            n_miss_ = snap_n_miss;
+            if (layer_stats_) {
+                layer_look_[il] = snap_layer_look;
+                layer_miss_[il] = snap_layer_miss;
+                for (auto & p : snap_counts) {
+                    layer_count_[il][p.first] = p.second;
+                }
+            }
+            out.resize(out_start);
             return false;
         }
 
@@ -1467,6 +1509,18 @@ bool bells_tensors::init_l2(ggml_backend_buffer_type_t buft, uint32_t n_l2_slot,
         return false;
     }
 
+    // Re-quantised cache and L2 cannot safely be combined with the current
+    // implementation: L1 and L2 would have different per-expert strides,
+    // tensor sizes and allocation geometries, and the L2 copy paths
+    // historically used the source stride for both sides, writing out of
+    // bounds when the types differ. Reject the combination explicitly
+    // rather than corrupting memory.
+    if (cache_type_ != GGML_TYPE_COUNT) {
+        fprintf(stderr, "%s: L2 cache not supported with re-quantised cache type %s - disable one of them\n",
+                __func__, ggml_type_name(cache_type_));
+        return false;
+    }
+
     l2_backend_ = l2_backend;
     l2_n_slot_  = n_l2_slot;
 
@@ -1484,10 +1538,10 @@ bool bells_tensors::init_l2(ggml_backend_buffer_type_t buft, uint32_t n_l2_slot,
         const entry & e = entries_[i];
         l2_entry & l2e  = l2_entries_[i];
 
-        l2e.gate    = bells_make_slice(l2_ctx_, e.src.gate,    n_l2_slot);
-        l2e.up      = bells_make_slice(l2_ctx_, e.src.up,      n_l2_slot);
-        l2e.down    = bells_make_slice(l2_ctx_, e.src.down,    n_l2_slot);
-        l2e.gate_up = bells_make_slice(l2_ctx_, e.src.gate_up, n_l2_slot);
+        l2e.gate    = bells_make_slice(l2_ctx_, e.src.gate,    n_l2_slot, cache_type_);
+        l2e.up      = bells_make_slice(l2_ctx_, e.src.up,      n_l2_slot, cache_type_);
+        l2e.down    = bells_make_slice(l2_ctx_, e.src.down,    n_l2_slot, cache_type_);
+        l2e.gate_up = bells_make_slice(l2_ctx_, e.src.gate_up, n_l2_slot, cache_type_);
 
         l2_info_[i].expert_slot.assign(n_expert, -1);
         l2_info_[i].slot_expert.assign(n_l2_slot, -1);
@@ -1612,9 +1666,30 @@ void bells_tensors::l2_admit_from_l1(uint32_t il, int32_t expert, int32_t l1_slo
 
     for (auto & p : pairs) {
         if (!p.l1 || !p.l2) continue;
-        const size_t stride = ggml_nbytes(p.l1) / p.l1->ne[2];
-        ggml_backend_tensor_get(p.l1, l2_stage_.data(), (size_t)l1_slot * stride, stride);
-        ggml_backend_tensor_set(p.l2, l2_stage_.data(), (size_t)l2s * stride, stride);
+        const size_t src_stride = ggml_nbytes(p.l1) / p.l1->ne[2];
+        const size_t dst_stride = ggml_nbytes(p.l2) / p.l2->ne[2];
+        // Strides must match — L2 is created with the same cache_type as L1,
+        // and the early reject in init_l2 guarantees we never get here with
+        // a mismatch. Validate anyway to avoid out-of-bounds writes.
+        if (src_stride != dst_stride) {
+            fprintf(stderr, "%s: stride mismatch L1 %zu vs L2 %zu, skipping L2 admit\n",
+                    __func__, src_stride, dst_stride);
+            continue;
+        }
+        const size_t src_stride_checked = src_stride;
+        const size_t dst_stride_checked = dst_stride;
+        const size_t src_off = (size_t)l1_slot * src_stride_checked;
+        const size_t dst_off = (size_t)l2s     * dst_stride_checked;
+        const size_t src_bytes = ggml_nbytes(p.l1);
+        const size_t dst_bytes = ggml_nbytes(p.l2);
+        if (src_off + src_stride_checked > src_bytes || dst_off + dst_stride_checked > dst_bytes ||
+            src_stride_checked > l2_stage_.size() || dst_stride_checked > l2_stage_.size()) {
+            fprintf(stderr, "%s: bounds check failed L1 off %zu+%zu/%zu L2 off %zu+%zu/%zu\n",
+                    __func__, src_off, src_stride_checked, src_bytes, dst_off, dst_stride_checked, dst_bytes);
+            continue;
+        }
+        ggml_backend_tensor_get(p.l1, l2_stage_.data(), src_off, src_stride_checked);
+        ggml_backend_tensor_set(p.l2, l2_stage_.data(), dst_off, dst_stride_checked);
     }
 
     info.slot_expert[l2s] = expert;
@@ -1648,9 +1723,25 @@ void bells_tensors::l2_promote(uint32_t il, int32_t expert, int32_t l1_slot) {
 
     for (auto & p : pairs) {
         if (!p.l2 || !p.l1) continue;
-        const size_t stride = ggml_nbytes(p.l2) / p.l2->ne[2];
-        ggml_backend_tensor_get(p.l2, l2_stage_.data(), (size_t)l2s * stride, stride);
-        ggml_backend_tensor_set(p.l1, l2_stage_.data(), (size_t)l1_slot * stride, stride);
+        const size_t src_stride = ggml_nbytes(p.l2) / p.l2->ne[2];
+        const size_t dst_stride = ggml_nbytes(p.l1) / p.l1->ne[2];
+        if (src_stride != dst_stride) {
+            fprintf(stderr, "%s: stride mismatch L2 %zu vs L1 %zu, skipping L2 promote\n",
+                    __func__, src_stride, dst_stride);
+            continue;
+        }
+        const size_t src_off = (size_t)l2s     * src_stride;
+        const size_t dst_off = (size_t)l1_slot * dst_stride;
+        const size_t src_bytes = ggml_nbytes(p.l2);
+        const size_t dst_bytes = ggml_nbytes(p.l1);
+        if (src_off + src_stride > src_bytes || dst_off + dst_stride > dst_bytes ||
+            src_stride > l2_stage_.size() || dst_stride > l2_stage_.size()) {
+            fprintf(stderr, "%s: bounds check failed L2 off %zu+%zu/%zu L1 off %zu+%zu/%zu\n",
+                    __func__, src_off, src_stride, src_bytes, dst_off, dst_stride, dst_bytes);
+            continue;
+        }
+        ggml_backend_tensor_get(p.l2, l2_stage_.data(), src_off, src_stride);
+        ggml_backend_tensor_set(p.l1, l2_stage_.data(), dst_off, dst_stride);
     }
 
     // remove from L2
@@ -1668,6 +1759,21 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
 
     const size_t src_stride = ggml_nbytes(src)/src->ne[2];
     const size_t dst_stride = ggml_nbytes(dst)/dst->ne[2];
+
+    // Validate tensor geometries before any pointer arithmetic. A mismatch
+    // between source and destination strides (e.g. re-quantised cache type)
+    // is handled via xfer_stride below, but offsets must still be within
+    // the actual allocation; otherwise we would write out of bounds.
+    const size_t src_bytes = ggml_nbytes(src);
+    const size_t dst_bytes = ggml_nbytes(dst);
+    if (src->ne[2] <= 0 || dst->ne[2] <= 0) {
+        return;
+    }
+    if ((size_t)expert >= (size_t)src->ne[2] || (size_t)slot >= (size_t)dst->ne[2]) {
+        fprintf(stderr, "%s: oob expert %d/%lld slot %d/%lld\n",
+                __func__, expert, (long long)src->ne[2], slot, (long long)dst->ne[2]);
+        return;
+    }
 
     const char * base = (const char *) src->data + (size_t) expert*src_stride;
 
@@ -1693,6 +1799,18 @@ void bells_tensors::copy_one(ggml_tensor * dst, ggml_tensor * src, int32_t exper
 
     const size_t xfer_stride = (cache_type_ != GGML_TYPE_COUNT && dst->type != src->type)
                              ? dst_stride : src_stride;
+
+    // Ensure the copy length plus destination offset stays inside the
+    // destination allocation, and the source offset plus copy length stays
+    // inside the source allocation. This prevents the L2+requant OOB where
+    // an incorrect stride was used for offset/size calculation.
+    const size_t src_off = (size_t)expert * src_stride;
+    const size_t dst_off = (size_t)slot * dst_stride;
+    if (src_off + xfer_stride > src_bytes || dst_off + xfer_stride > dst_bytes) {
+        fprintf(stderr, "%s: bounds violation src off %zu+%zu/%zu dst off %zu+%zu/%zu (src_stride %zu dst_stride %zu xfer %zu)\n",
+                __func__, src_off, xfer_stride, src_bytes, dst_off, xfer_stride, dst_bytes, src_stride, dst_stride, xfer_stride);
+        return;
+    }
 
     // BELLS_SYNC_COPY=1 forces the fully blocking copy. Diagnostic for the sm_86 corruption:
     // if garbage survives a synchronous copy then the defect is in the data or the indexing,
@@ -3309,6 +3427,13 @@ void bells_runtime::begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens) {
     if (adapt_every_ > 0 && (n_tok_seen_ % adapt_every_) == 0) {
         std::vector<bells_cache::adapt_swap> swaps;
         cache_.adapt(swaps, adapt_swaps_, adapt_min_, adapt_thresh_);
+        if (!swaps.empty()) {
+            // Swaps overwrite slot memory that the previous token's matmuls
+            // may still be reading. Wait for all queued compute to finish
+            // before reusing the memory; stream ordering does not cover
+            // the case where the write is issued off the compute stream.
+            tensors_.sync_compute();
+        }
         for (const auto & sw : swaps) {
             if (tensors_.has_l2() && sw.copy.evicted >= 0) {
                 tensors_.l2_admit_from_l1(sw.il, sw.copy.evicted, sw.copy.slot);

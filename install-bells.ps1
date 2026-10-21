@@ -58,9 +58,34 @@ if (-not $repoDir) {
         }
     } else {
         Write-Host "[BELLS] Updating repository at $repoDir..." -ForegroundColor Yellow
-        try { git -C $repoDir fetch origin 2>&1 | Out-Null } catch {}
-        try { git -C $repoDir checkout bells-next 2>&1 | Out-Null } catch {}
-        try { git -C $repoDir reset --hard origin/bells-next 2>&1 | Out-Null } catch {}
+        # Preserve local changes: do not run reset --hard if the worktree is dirty.
+        $hasChanges = $false
+        try {
+            git -C $repoDir diff --quiet --ignore-submodules
+            if ($LASTEXITCODE -ne 0) { $hasChanges = $true }
+            git -C $repoDir diff --cached --quiet --ignore-submodules
+            if ($LASTEXITCODE -ne 0) { $hasChanges = $true }
+        } catch { $hasChanges = $false }
+
+        if ($hasChanges) {
+            Write-Host "[BELLS] Local changes detected — skipping git update to preserve them." -ForegroundColor Yellow
+            Write-Host "[BELLS] Commit or stash your changes, then re-run the installer to update." -ForegroundColor Yellow
+        } else {
+            # Fetch and fast-forward only; do not discard local commits.
+            $fetchOk = $true
+            try { git -C $repoDir fetch origin 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { $fetchOk = $false } } catch { $fetchOk = $false }
+            if (-not $fetchOk) {
+                Write-Host "[BELLS] WARNING: git fetch failed — keeping current checkout" -ForegroundColor Yellow
+            } else {
+                try { git -C $repoDir checkout bells-next 2>&1 | Out-Null } catch {}
+                $mergeOk = $true
+                try { git -C $repoDir merge --ff-only origin/bells-next 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { $mergeOk = $false } } catch { $mergeOk = $false }
+                if (-not $mergeOk) {
+                    Write-Host "[BELLS] WARNING: could not fast-forward — local commits or diverged history, keeping current state" -ForegroundColor Yellow
+                    Write-Host "[BELLS] Preserve your work and run: git -C $repoDir merge --ff-only origin/bells-next" -ForegroundColor Yellow
+                }
+            }
+        }
     }
 }
 
@@ -68,6 +93,10 @@ if (-not $repoDir) {
 $installer = Join-Path $repoDir "tools\bells-manager\install.py"
 Write-Host "[BELLS] Running installer..." -ForegroundColor Yellow
 & $pyExe $installer
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[BELLS] Installer failed" -ForegroundColor Red
+    exit 1
+}
 
 Write-Host ""
 Write-Host "[BELLS] Done! Run 'bells' to start." -ForegroundColor Green

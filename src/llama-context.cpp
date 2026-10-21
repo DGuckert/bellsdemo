@@ -828,6 +828,19 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // BELLS owns VRAM buffers and issues async copies on secondary streams.
+    // Its buffers and copy events must be released before the backends they
+    // were allocated from are destroyed. Member destruction order is the
+    // reverse of declaration order, so without an explicit reset here the
+    // backend pointers (backends, bells_copy_backend, sched) would be freed
+    // first, leaving bells to free buffers through dangling handles — a
+    // use-after-free during teardown.
+    if (bells) {
+        bells.reset();
+    }
+    bells_copy_backend.reset();
+    bells_l2_backend.reset();
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 

@@ -347,6 +347,19 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
 endif()
 
+# BELLS regression tests for critical bug fixes
+llama_build_and_test(test-bells-cache-regression.cpp)
+target_link_libraries(test-bells-cache-regression PRIVATE llama)
+
+# Python-level regression for safe extraction and bin preservation
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_FOUND)
+    add_test(NAME test-bells-manager-regression
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-bells-manager-regression.py
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_property(TEST test-bells-manager-regression PROPERTY LABELS "main")
+endif()
+
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)

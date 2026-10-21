@@ -151,18 +151,36 @@ def _detect_model_arch(model_path: str, cli_path: str) -> dict:
 
     # Fallback: run llama-cli briefly with GPU offload to read the log
     try:
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "env": {**os.environ, "GGML_CUDA_NO_PINNED": "1"},
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            try:
+                popen_kwargs["start_new_session"] = True
+            except Exception:
+                pass
+
         proc = subprocess.Popen(
             [cli_path, "-m", model_path, "-n", "0", "-p", "x", "--no-display-prompt",
              "--simple-io", "-ngl", "99", "-c", "32"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env={**os.environ, "GGML_CUDA_NO_PINNED": "1"},
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            **popen_kwargs,
         )
         try:
             stdout, stderr = proc.communicate(timeout=90)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
 
         output = (stderr or "") + (stdout or "")
         for line in output.splitlines():

@@ -27,11 +27,29 @@ class ServerProcess:
             return
         self.log_lines.clear()
         env = {**os.environ, "GGML_CUDA_NO_PINNED": "1"}
+        # Platform-aware process creation: CREATE_NEW_PROCESS_GROUP is
+        # Windows-only and required for CTRL_BREAK_EVENT to work. On POSIX
+        # it is not needed and may not be defined in some environments.
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1,
+            "env": env,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            # On POSIX, start a new process group so we can terminate the
+            # whole group if needed.
+            try:
+                popen_kwargs["start_new_session"] = True
+            except Exception:
+                pass
+
         self.proc = subprocess.Popen(
             [exe] + args,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, env=env,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            **popen_kwargs,
         )
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
@@ -48,12 +66,25 @@ class ServerProcess:
         if not self.proc or self.proc.poll() is not None:
             return
         try:
-            self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            if os.name == "nt":
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                self.proc.terminate()
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
         except Exception:
-            pass
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
 
     def status(self) -> dict:
         if not self.proc:
@@ -191,7 +222,17 @@ class Api:
         }
 
     def open_folder(self, path: str):
-        os.startfile(path)
+        # Platform-aware: os.startfile exists only on Windows
+        try:
+            if os.name == "nt" and hasattr(os, "startfile"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            # Log but don't crash the UI
+            print(f"Could not open folder {path}: {e}", file=sys.stderr)
 
 
 def launch():

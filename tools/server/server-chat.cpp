@@ -153,7 +153,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         prev_msg["content"] = json::array();
                     }
                     auto & prev_content = prev_msg["content"];
-                    prev_content.insert(prev_content.end(), chatcmpl_content.begin(), chatcmpl_content.end());
+                    prev_content.insert(chatcmpl_content);
                 } else {
                     item.erase("status");
                     item.erase("type");
@@ -203,10 +203,24 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 } else {
                     json chatcmpl_outputs = item.at("output");
                     for (json & chatcmpl_output : chatcmpl_outputs) {
-                        if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
-                            throw std::invalid_argument("Output of tool call should be 'Input text'");
+                        if (!chatcmpl_output.contains("type")) {
+                            throw std::invalid_argument("Output of tool call missing 'type' field");
                         }
-                        chatcmpl_output["type"] = "text";
+                        const auto type = chatcmpl_output.at("type");
+                        if (type != "input_text" && type != "input_image") {
+                            throw std::invalid_argument("Output of tool call should be 'Input text' or 'Input image'");
+                        }
+                        if (type == "input_text") {
+                            chatcmpl_output["type"] = "text";
+                        } else if (type == "input_image") {
+                            if (!chatcmpl_output.contains("image_url")) {
+                                throw std::invalid_argument("'image_url' is required");
+                            }
+                            chatcmpl_output["type"] = "image_url";
+                            chatcmpl_output["image_url"] = json {
+                                {"url", chatcmpl_output.at("image_url")}
+                            };
+                        }
                     }
                     chatcmpl_messages.push_back(json {
                         {"content",      chatcmpl_outputs},
@@ -257,8 +271,11 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         for (json resp_tool : response_body.at("tools")) {
             json chatcmpl_tool;
 
-            if (json_value(resp_tool, "type", std::string()) != "function") {
-                throw std::invalid_argument("'type' of tool must be 'function'");
+            const std::string type = json_value(resp_tool, "type", std::string());
+            if (type != "function") {
+                // Non-function Responses tools have no Chat Completions equivalent.
+                SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
+                continue;
             }
             resp_tool.erase("type");
             chatcmpl_tool["type"] = "function";
@@ -270,12 +287,23 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             chatcmpl_tools.push_back(chatcmpl_tool);
         }
         chatcmpl_body.erase("tools");
-        chatcmpl_body["tools"] = chatcmpl_tools;
+        if (!chatcmpl_tools.empty()) {
+            chatcmpl_body["tools"] = chatcmpl_tools;
+        }
     }
 
     if (response_body.contains("max_output_tokens")) {
         chatcmpl_body.erase("max_output_tokens");
         chatcmpl_body["max_tokens"] = response_body["max_output_tokens"];
+    }
+
+    if (response_body.contains("reasoning")) {
+        // Only "effort" is handled so far
+        const json & reasoning = response_body.at("reasoning");
+        if (reasoning.contains("effort")) {
+            chatcmpl_body["reasoning_effort"] = reasoning.at("effort");
+        }
+        chatcmpl_body.erase("reasoning");
     }
 
     return chatcmpl_body;
@@ -426,22 +454,70 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                     std::string tool_use_id = json_value(block, "tool_use_id", std::string());
 
                     auto result_content = json_value(block, "content", json());
-                    std::string result_text;
                     if (result_content.is_string()) {
-                        result_text = result_content.get<std::string>();
+                        tool_results.push_back({
+                            {"role", "tool"},
+                            {"tool_call_id", tool_use_id},
+                            {"content", result_content.get<std::string>()}
+                        });
                     } else if (result_content.is_array()) {
+                        // Single-pass: build both text and content_parts, decide format at the end
+                        std::string result_text;
+                        json content_parts = json::array();
+                        bool has_images = false;
+
                         for (const auto & c : result_content) {
-                            if (json_value(c, "type", std::string()) == "text") {
-                                result_text += json_value(c, "text", std::string());
+                            std::string c_type = json_value(c, "type", std::string());
+                            if (c_type == "text") {
+                                std::string text = json_value(c, "text", std::string());
+                                result_text += text;
+                                content_parts.push_back({
+                                    {"type", "text"},
+                                    {"text", text}
+                                });
+                            } else if (c_type == "image") {
+                                has_images = true;
+                                json source = json_value(c, "source", json::object());
+                                std::string source_type = json_value(source, "type", std::string());
+                                if (source_type == "base64") {
+                                    std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
+                                    std::string data = json_value(source, "data", std::string());
+                                    std::string url = "data:" + media_type + ";base64," + data;
+                                    content_parts.push_back({
+                                        {"type", "image_url"},
+                                        {"image_url", {{"url", url}}}
+                                    });
+                                } else if (source_type == "url") {
+                                    content_parts.push_back({
+                                        {"type", "image_url"},
+                                        {"image_url", {{"url", json_value(source, "url", std::string())}}}
+                                    });
+                                }
                             }
                         }
-                    }
 
-                    tool_results.push_back({
-                        {"role", "tool"},
-                        {"tool_call_id", tool_use_id},
-                        {"content", result_text}
-                    });
+                        if (!has_images) {
+                            // Text-only: collapse to a plain string for maximum compatibility
+                            tool_results.push_back({
+                                {"role", "tool"},
+                                {"tool_call_id", tool_use_id},
+                                {"content", result_text}
+                            });
+                        } else {
+                            // Mixed or image-only: use array content parts (OpenAI multimodal tool format)
+                            tool_results.push_back({
+                                {"role", "tool"},
+                                {"tool_call_id", tool_use_id},
+                                {"content", content_parts}
+                            });
+                        }
+                    } else {
+                        tool_results.push_back({
+                            {"role", "tool"},
+                            {"tool_call_id", tool_use_id},
+                            {"content", ""}
+                        });
+                    }
                 }
             }
 
@@ -575,14 +651,14 @@ json server_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff) {
 json convert_transcriptions_to_chatcmpl(
         const json & inp_body,
         const common_chat_templates * tmpls,
-        const std::map<std::string, raw_buffer> & in_files,
+        const std::map<std::string, uploaded_file> & in_files,
         std::vector<raw_buffer> & out_files) {
     // TODO @ngxson : this function may need to be improved in the future
     // handle input files
     out_files.clear();
     auto it = in_files.find("file");
     if (it != in_files.end()) {
-        out_files.push_back(it->second);
+        out_files.push_back(it->second.data);
     } else {
         throw std::invalid_argument("No input file found for transcription");
     }

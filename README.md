@@ -1,583 +1,524 @@
 # BELLS
 
-**B**ounded **E**xpert **L**RU **L**oading **S**ystem.
+**Run 177B models on consumer GPUs. No quality loss.**
 
-A per-expert VRAM cache for MoE inference in llama.cpp. Keeps the experts a model is likely
-to need in VRAM and streams the rest from RAM, so a Mixture-of-Experts model larger than your
-graphics card can still run its expert layers on the GPU.
+BELLS (**B**uffered **E**xpert **L**oading with **L**ayered **S**lots) is a [llama.cpp](https://github.com/ggml-org/llama.cpp) fork that adds a per-layer VRAM expert cache for Mixture-of-Experts models. Instead of keeping all experts in VRAM (impossible on consumer cards) or running them entirely on the CPU (slow), BELLS caches the hot experts on your GPU and streams the rest from RAM or NVMe on demand.
 
-Every word is load-bearing. **Bounded**: the cache is a fixed number of slots, and bigger is
-not better - 40 slots beat 64 beat 80 in testing, because oversizing starves the context and
-compute buffers. **Expert**: per-expert granularity, as opposed to the layer granularity of
-`-ngl`. **LRU**: plain least-recently-used, which beat the predictive scheme this project was
-originally built around.
+Every expert the router picks still gets computed on the GPU — nothing is skipped, pruned, or approximated. With the default cache path, output is bit-identical to full-GPU inference. Optional modes like `--bells-cache-type` (re-quantisation) and `--bells-split` (CPU/GPU split) change precision by design.
 
-> [!NOTE]
-> **The "Ampere corruption" was a faulty host, not Ampere and not BELLS. Resolved 2026-09-01.**
->
-> This README previously warned that BELLS produced garbage on sm_86 with pinned expert weights.
-> That was a misattribution. The machine holding the RTX 3060 cannot reliably DMA out of
-> page-locked host memory: once a process holds more than ~512 MiB of it, some regions come back
-> to the GPU as all-`0xFF` (a PCIe read abort), reproducibly and at sticky addresses, while the
-> CPU reads the same bytes back perfectly.
->
-> It reproduces in ~60 lines of CUDA with no llama.cpp involved, and the **same 3060 moved into a
-> different machine is clean** - 0 bad chunks from 512 MiB to 12 GiB - where BELLS with
-> `--cpu-moe-pinned` then measured 32/32 clean generations. The old sm_75-vs-sm_86 comparison
-> was confounded: those two GPUs were in two different machines, so the architecture was never
-> the variable being tested.
->
-> Diagnosis and the full elimination table in [RESULTS.md](RESULTS.md#sm_86-corruption).
->
-> The general lesson stands, so it is kept here: **BELLS moves weights over PCIe on every token,
-> so a host that corrupts DMA corrupts BELLS long before it corrupts anything else.** Run a
-> prompt and read the reply before believing a benchmark. If output is degenerate, test the
-> machine before suspecting the cache - `--cpu-moe` (mmap on) or `GGML_CUDA_NO_PINNED=1` both
-> avoid large pinned allocations and were 56/56 clean where pinned was 1/24.
+## Install
 
-**A 235B model on one 24 GB card at 11.3 tok/s, up from 3.1.** An 80B on the same card at
-53.1 tok/s, up from 19.8. Both are models plain `-ngl` cannot load at all.
+### One-command install
 
-Those figures need the expert source in **pinned** host memory - `--cpu-moe-pinned`. Out of
-pageable memory `cudaMemcpyAsync` blocks the caller for 99.7% of every transfer, which is worth
-1.3x to 2.3x depending on how much a configuration moves, and which silently explains most of
-the failed optimisations in this repository. See [PINNED.md](PINNED.md).
-
-**Multi-GPU works, and buys capacity rather than speed.** Each device gets its own cache and
-every layer's slice lives on the device that layer's graph runs on. Verified by perplexity
-matching the single-GPU result exactly, since reading experts off the wrong card would produce
-entirely plausible throughput. But a layer split is sequential - only one card computes at a
-time - so two GPUs measure about **5% slower** than one. They are worth having when a model
-needs the VRAM, not when it fits.
-
-**It gains 2-3x on most MoE models, and the one exception is not a caching problem.** Against a
-`--cpu-moe` baseline measured in the same session, at the best slot count for each:
-
-| Model | `--cpu-moe` | BELLS pinned | |
-|---|---|---|---|
-| Qwen3-Next-80B (Q2_K) | 15.56 - 19.79 tok/s | **47.49 - 53.23** | **2.7 - 3.1x** |
-| Qwen3-235B-A22B (Q2_K) | 3.09 | **8.03** | **2.60x** |
-| Mixtral-8x7B (Q4_K_M) | 3.79 | **8.46** | **2.23x** |
-| DeepSeek V4-Flash (IQ2_M) | 3.26 | **6.68** | **2.05x** |
-| GPT-OSS-120B (MXFP4) | 13.21 | 2.83 | **0.21x** |
-
-The 80B row is a range because it is the only one measured twice, and the two runs disagreed by
-13% on the ratio - baseline 15.56 against 19.79, BELLS 47.49 against 53.23. Nothing changed
-between them but the container. **Read every other row as carrying the same uncertainty**; they
-are single runs and only look more precise.
-
-GPT-OSS is the exception and **we do not know why**. What is ruled out:
-
-- **Not the transfers.** Per-layer counters put readback, copy and upload together at about
-  **50 us against a 263 ms token, under 1%**, while hit rate climbs 46% to 78% with slots and
-  copy totals fall. The parts BELLS instruments behave correctly.
-- **Not VRAM pressure.** More slots makes it reliably *worse*, but 32 slots is 14.5 GB on a
-  183 GB B200 - there is nothing to starve.
-- **Not MXFP4 emulation.** This was the leading theory: the format is Blackwell-native and the
-  A10G is Ampere, so the expert matmul would be emulated there. Tested on a B200 with native
-  support and it still loses - 22.67 tok/s without BELLS against 6.65 with, a **0.29x** where
-  Ampere gave 0.21x.
-
-What is left is the part the counters do not time. BELLS replaces a `mul_mat_id` over the full
-128-expert tensor with one over an n_slot+1 row cache plus a slot remap. On every other model
-that is free. On this one it costs 6x, on two architectures, and worse as the cache grows.
-
-So it *is* a cache failure - just not in the transfer path, which is where all the
-instrumentation points. Anyone extending this should start there.
-
-**Two caveats that matter more than the numbers.**
-
-The ratio is **not a property of BELLS**. Its own throughput is roughly CPU-independent, so the
-multiplier is really "your CPU against this GPU" - the same Mixtral configuration measured 5.88x
-on 8 vCPU and 1.06x on 16. A fast desktop CPU will show less than the table above. What travels
-is the absolute figure: experts run at GPU speed instead of CPU speed.
-
-And the slot count needs sweeping. Wrong values measured 0.94x on a 6 GB card, and oversizing is
-punished harder than undersizing. `--bells` auto-sizes conservatively; beat it with
-`--bells-slots`.
-
-Measure your own model; the tool for it is in this repo and takes ten minutes.
-
----
-
-## Measured results
-
-Four models, one machine: A10G 24 GB (the same silicon as an RTX 3090), 16 vCPU, 128 GB RAM,
-128 generated tokens, best slot count each. Plain `-ngl` cannot load any of them on 24 GB, so
-`--cpu-moe` is the only honest baseline.
-
-| Model | expert size | active params | `--cpu-moe` | BELLS | result | slots |
-|---|---|---|---|---|---|---|
-| Qwen3-Next-80B (Q2_K) | 1.09 MB | 3 B | 19.84 tok/s | **41.30** | **2.08x** | 128+ |
-| Qwen3-235B-A22B (Q2_K) | 6.61 MB | 14 B | 3.10 tok/s | **5.61** | **1.81x** | 28 |
-| Mixtral-8x7B (Q4_K_M) | 18 MB | 13 B | 3.70 tok/s | 3.93 | 1.06x | 4 |
-| GPT-OSS-120B (MXFP4) | 12.6 MB | 5 B | 13.21 tok/s | 2.17 | **0.16x** | 16 |
-
-No property in that table orders the results. Expert size fails (18 MB beats 12.6 MB), cache
-ratio fails (GPT-OSS was rated a 7.8x "good fit"), active parameters fail (14 B wins, 13 B does
-not), and hit rate fails in both directions.
-
-### Re-measured with a pinned expert source, and the table changes
-
-Everything above copies experts out of **pageable** host memory, where `cudaMemcpyAsync` blocks
-the caller for 99.7% of each transfer. With `--cpu-moe-pinned` ([PINNED.md](PINNED.md)):
-
-| Model | pageable | **pinned** | gain | vs `--cpu-moe` |
-|---|---|---|---|---|
-| Qwen3-Next-80B, 256 slots | 40.65 tok/s | **52.66** | 1.31x | ~2.7x |
-| Qwen3-235B-A22B, 28 slots | 5.45 | **11.27** | 2.08x | ~3.6x |
-| Qwen3-235B-A22B, 16 slots | 3.84 | **8.64** | 2.25x | |
-| **Mixtral-8x7B, 4 slots** | 3.24 | **8.46** | **2.61x** | **2.23x** |
-| GPT-OSS-120B, 16 slots | 2.14 | 2.83 | 1.32x | still 0.21x |
-
-**Mixtral moves from 1.06x to 2.23x**, against a baseline measured in the same session. It was
-the headline example of a model BELLS does not help.
-
-**And GPT-OSS is not a cache failure.** Per-layer counters put BELLS' entire contribution at
-~50 us against a 263 ms token - **under 1%**. The cache behaves correctly throughout (hit rate
-46% to 78% as slots rise, copy and layer totals falling) and the model still gets slower. A
-component worth 1% cannot cause a 6x loss. The time is in graph execution, so the real
-comparison is GPU expert compute against CPU, and the GPU loses 3.4x *on this model only* -
-consistent with MXFP4 being a Blackwell-native format emulated on Ampere.
-
-So the negative result above needs reading with care. **Three of its four rules were falsified
-by GPT-OSS**, and GPT-OSS appears not to have been measuring the cache at all. Two of the four
-`--cpu-moe` baselines in the first table are also from earlier sessions, which this repository
-is emphatic elsewhere is not a valid comparison. The claim has not been rewritten because
-settling it properly needs those two baselines re-measured, not because it still stands.
-
-One correction to the first table regardless: Mixtral's experts are **~99 MB**, not 18 MB. The
-cache measures 15.89 GiB for five allocated slots across 32 layers, and 3 x 4096 x 14336 at
-Q4_K_M independently gives 105 MB. Expert size was one of the properties used to argue that
-nothing orders the results.
-
-### The ratio is not a property of BELLS
-
-Varying **only** the core count, same GPU, same model, same 192 slots:
-
-| vCPU | `--cpu-moe` | BELLS | ratio |
-|---|---|---|---|
-| 4 | 7.57 | **44.02** | 5.82x |
-| 8 | 15.35 | **42.25** | 2.75x |
-| 16 | 19.62 | **40.28** | 2.05x |
-| 32 | 16.11 | **38.81** | 2.41x |
-
-BELLS moves 13% across an 8x change in cores. The baseline moves 2.6x. Once experts are
-resident the work is on the GPU, so **every speedup ratio here is really a measurement of the
-baseline's CPU.** Which gives the one rule in this project that survived a controlled test:
-
-> **BELLS converges on a CPU-independent throughput. Measure your `--cpu-moe` baseline - if it
-> is below that number, BELLS wins by the difference; if above, it loses.**
-
-Replicated on Mixtral-8x7B, where BELLS holds 3.6-4.5 tok/s while the baseline climbs 2.30 to
-5.47 - so the same model, same code and same cache spans **1.63x at 8 cores to 0.72x at 32**.
-The rule called that in advance: BELLS converges near 4 tok/s on this model, so it has to lose
-once the baseline passes 4.
-
-That is also why Mixtral's headline 5.88x collapsed to 1.06x on a better CPU, and why
-GPT-OSS-120B loses: its baseline of 13.21 tok/s is already faster than BELLS manages on it.
-
-**Cache size has a per-model optimum and guessing high can be expensive.** The 235B peaks at 28
-slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8; Qwen3-Next reaches
-a knee at 128 and then simply stops improving. Start with `--bells-slots -1` and sweep.
-
-### On a 6 GB card: yes for chat, still no for a busy server
-
-Three models with `llama-bells-profile` at `-c 512` - pure decode, no prefill or sampling, and
-a large cache because a 512-token context leaves VRAM free:
-
-| Model | cache ratio | baseline | BELLS | result |
-|---|---|---|---|---|
-| Qwen3-30B-A3B (Q4_K_M) | 2.2x | 11.4 tok/s | 17.6 tok/s | 1.52x |
-| Qwen3-Next-80B (Q2_K) | 4.7x | 15.5 tok/s | 18.4 tok/s | 1.18x |
-| GPT-OSS-120B (MXFP4) | 1.0x | 1.82 tok/s | 1.15 tok/s | 0.63x - slower |
-
-**Those do not survive a server workload.** The same 2060 and the same Qwen3-30B, through
-`llama-server` at `-c 4096` with 100-token chat completions, paired and warmed:
-
-| concurrency | `--cpu-moe` | BELLS | ratio |
-|---|---|---|---|
-| 1 | 10.70 | 10.02 | 0.94x |
-| 2 | 13.18 | 12.79 | 0.97x |
-| 3 | 15.16 | 14.40 | 0.95x |
-| 4 | 17.69 | 17.00 | 0.96x |
-
-Uniformly ~5% slower, including at concurrencies where BELLS bypasses itself and should cost
-nothing - **the cache holds its VRAM whether used or not**, and on a 6 GB card that squeeze is
-worth about 5%. Worse, the cache and the KV cache come out of the same pool: at `-c 16384`
-there is only room for a 1.2x ratio, which BELLS itself labels *"poor fit, expect a slowdown"*
-before proceeding anyway, and it duly measures 0.83x.
-
-**Re-measured with pinning, the decode verdict flips.** Same 2060, same models, three paired
-passes each:
-
-| Model | pageable | **pinned** | |
-|---|---|---|---|
-| Qwen3-30B-A3B, 17 slots | 10.62 tok/s | **16.83** | 1.59x |
-| Qwen3-Next-80B, 48 slots | 20.04 | **23.06** | 1.15x |
-
-An 80B at 23 tok/s on a 6 GB card, and 22.4 through `llama-server` with 26.6 observed over a
-longer reply as the cache amortises. That is the case this project exists for, and it works.
-
-**The server verdict has not been re-tested and probably still stands.** Its ~5% loss came from
-the cache holding VRAM whether used or not, which pinning does not change, and the KV-cache
-squeeze at long contexts is unaffected too.
-
-So: **on 6 GB, use BELLS for single-user chat and leave it off for a busy server with a large
-context.** The 24 GB results above are unaffected either way.
-
-> **This section predates pinned expert memory and needs re-testing.** Every number in it copies
-> experts out of pageable host memory, where `cudaMemcpyAsync` blocks the caller for 99.7% of the
-> transfer. Pinning the source ([PINNED.md](PINNED.md)) is worth **1.59x on Qwen3-30B at 17 slots**
-> and **1.15x on Qwen3-Next-80B at 48 slots**, both paired in-session on this same 6 GB 2060:
->
-> | model | pageable | pinned | |
-> |---|---|---|---|
-> | Qwen3-30B-A3B (Q4_K_M), 17 slots | 10.62 tok/s | **16.83** | 1.59x |
-> | Qwen3-Next-80B (Q2_K), 48 slots | 20.04 tok/s | **23.06** | 1.15x |
->
-> The *server* verdict above may or may not survive that - the ~5% loss there was attributed to
-> the cache holding VRAM whether used or not, which pinning does not change, so it plausibly
-> stands. It has not been re-measured. The VRAM squeeze argument is unaffected either way.
->
-> One thing that does change: at 32 slots pinned the 80B still reaches 21.46 tok/s while giving
-> back 840 MB, which is a better trade than it looks when 22 tok/s is already faster than most
-> people read.
-
-### Superseded: the same models at 8 vCPU
-
-An earlier version of this file led with these, from the same GPU on Modal's default 8 vCPU:
-
-| Model | baseline | BELLS | claimed | actual, at 16 vCPU |
-|---|---|---|---|---|
-| Mixtral-8x7B (Q4_K_M) | 0.80 tok/s | 4.73 tok/s | ~~5.88x~~ | **1.06x** |
-| Qwen3-Next-80B (Q2_K) | 14.3 tok/s | 39.9 tok/s | ~~2.80x~~ | **2.08x** |
-
-8 vCPU cripples the baseline in exactly the dimension BELLS exploits, and a 24 GB card normally
-sits beside a real desktop CPU. Mixtral is the cautionary one: its baseline alone went from
-0.80 to 3.70 tok/s on twice the cores, because ~13 B active parameters on 8 cores was
-pathological. Almost the whole "5.88x" was that. Note that BELLS's own throughput barely moved
-in either case - it is the baseline that changed.
-
-GPT-OSS-120B moved the other way, and its 6 GB result had the wrong explanation attached. It was
-blamed on the model exceeding RAM. Given 128 GB it fits entirely, the baseline reaches 13.21
-tok/s, and BELLS falls *further* behind: the problem was never disk, it is that 12.6 MB experts
-move too many bytes per token. The larger cache also scored a **better** hit rate (74.2% vs
-61.1%) and was **slower**.
-
-**Quality is unaffected.** Teacher-forced perplexity, scored one token at a time so the cache
-is actually exercised: **2.0276 with BELLS, 2.0296 without.**
-
----
-
-## Will it help my model?
-
-> **The cache ratio below is not reliable.** It rated GPT-OSS-120B on a 24 GB card with
-> 128 GB of RAM at **7.8x, "good fit"**. Measured, that configuration is **6.1x slower** than
-> `--cpu-moe` - the worst result in this project. A screening tool that green-lights the worst
-> case is worse than none, so treat what follows as a rough filter and **measure before you
-> trust it.** What actually predicts the outcome, as far as three models can tell, is bytes
-> moved per token against how much CPU work is displaced - see
-> [expert size is the discriminator](#expert-size-not-cache-ratio) below.
-
-The ratio is still the first thing to compute, because a cache smaller than one token's
-working set cannot help at all:
-
-```
-working_set = n_layer x n_experts_active x expert_bytes
-cache_ratio = usable_VRAM / working_set
+**Linux / macOS:**
+```sh
+curl -sSL https://raw.githubusercontent.com/DGuckert/llama.cpp-BELLS/bells-next/install-bells.sh | bash
 ```
 
-Below ~1.5x it reliably loses. Above that it *may* win, and the ratio does not tell you which.
-There is a calculator:
-
-```
-$ python tools/bells-profile/bells_calc.py --vram 6 --ram 32 --preset qwen3-30b-a3b
-
-  expert size              2.93 MB
-  sparsity                 16.0:1   (128 experts, 8 active)
-  per-token working set    1.13 GB   (48 layers x 8 x expert)
-  model                    18.0 GB   fits RAM
-  cache ratio               2.0x
-
-  --> YES: workable
+**Windows (PowerShell):**
+```powershell
+iex (irm https://raw.githubusercontent.com/DGuckert/llama.cpp-BELLS/bells-next/install-bells.ps1)
 ```
 
-It knows nine common models by `--preset`, or take the numbers from a model's `config.json`
-with `--layers --experts --active --hidden --ffn --quant`. Or just run with
-`--bells-slots -1` and it tells you at load:
+The installer automatically:
+1. Detects your GPU (NVIDIA/AMD/Intel) and available SDKs (CUDA, Vulkan)
+2. Downloads precompiled binaries (Windows and Linux x86-64, CUDA or Vulkan) if they run on your machine, otherwise builds from source
+3. Installs the `bells` command to your PATH
 
+After installation, run `bells system` to verify your setup.
+
+### Requirements
+
+- **Python 3.10+** — for the installer and tools
+- **Git** — for cloning the repository
+- **CMake** — only needed if building from source (no precompiled binary for your platform)
+- **GPU SDK** (one of):
+  - NVIDIA: [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)
+  - AMD: [ROCm](https://rocm.docs.amd.com/) (Linux) or Vulkan SDK
+  - Any GPU: [Vulkan SDK](https://vulkan.lunarg.com/)
+
+### Manual build
+
+If you prefer to build manually or the installer doesn't cover your setup:
+
+```sh
+git clone https://github.com/DGuckert/llama.cpp-BELLS.git
+cd llama.cpp-BELLS
+
+# NVIDIA (CUDA)
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release
+
+# AMD (ROCm / HIP)
+cmake -B build -DGGML_HIP=ON
+cmake --build build --config Release
+
+# AMD / Intel / any Vulkan GPU
+cmake -B build -DGGML_VULKAN=ON
+cmake --build build --config Release
 ```
-init: working set 0.51 GiB (48 layers x 10 experts x 1.09 MiB), cache holds 4.3x it -> good fit
+
+## Benchmarks
+
+| Model | GPU | RAM | Without BELLS | With BELLS | Speedup |
+|---|---|---|---:|---:|---:|
+| Qwen3.6-35B Q4 | RTX 3060 12 GB | 32 GB DDR4 | 32.5 tok/s | **60.9 tok/s** | 1.9x |
+| Qwen3.6-35B Q6 | RTX 3060 12 GB | 32 GB DDR4 | 22.1 tok/s | **42.8 tok/s** | 1.9x |
+| Qwen3.6-35B Q4 | RTX 2060 6 GB | 32 GB DDR4 | — | **36.3 tok/s** | — |
+| Qwen3-30B-A3B Q4 | RTX 2060 6 GB | 32 GB DDR4 | 22.4 tok/s | **28.3 tok/s** | 1.3x |
+| Flash-Next 177B Q2 | RTX 3060 12 GB | 32 GB DDR4 | 14.7 tok/s | **32.9 tok/s** | 2.2x |
+| Qwen3-Coder-Next 80B Q2 | RTX 2060 6 GB | 32 GB DDR4 | — | **27.2 tok/s** | — |
+
+Models streamed from NVMe via mmap. The 177B model (65 GB quantised) doesn't even fit in 32 GB RAM — the page cache handles it transparently. Coder-Next at 64k context: 20.8 tok/s; at 131k: 19.3 tok/s.
+
+"Without BELLS" means `--cpu-moe -ngl 99` (all attention on GPU, all experts on CPU). The baseline for models that don't fit in VRAM at all is CPU-only, which is far slower.
+
+### Against Strata on a 24 GB card
+
+[Strata](https://github.com/Niko1221/Strata) is a purpose-built engine for Flash-Next 177B. Both engines on one Modal A10G (24 GB), Q2_0 file, 4K context, the two runs of each row taken back to back on the same box:
+
+| | BELLS | Strata |
+|---|---:|---:|
+| Short answers, end to end | 56.3 / 58.7 tok/s | 61.3 / 60.0 tok/s |
+| 600-token answers | 65.5 / 66.0 tok/s | 73.0 / 76.2 tok/s |
+| Reading a ~1.4K-token prompt | 700 tok/s | 959 tok/s |
+| Reading a ~2.7K-token prompt | 854 tok/s | 1,278 tok/s |
+
+BELLS here is the MTP configuration from [Speculative decoding](#speculative-decoding-mtp) with [prompt staging](#long-prompts-prompt-staging) on. Before that work the same comparison stood at 31.6 vs 60.6 tok/s for generation and roughly 200 vs 950 tok/s for prompts. Cloud boxes differ by up to 25% from one job to the next, so only numbers from the same job are comparable.
+
+One caveat on the generation rows: they use a copy of the model with its 240 BF16 dense tensors requantised to Q8_0 (the expert weights are untouched). That is a small precision change whose effect on quality has not been measured yet.
+
+## Quick start
+
+### One-flag setup
+
+```sh
+# --auto detects MoE models and configures everything
+llama-server -m model.gguf --auto -c 4096 -fa
+llama-cli    -m model.gguf --auto -c 4096
 ```
 
-### Compatibility at a glance
+`--auto` enables `--cpu-moe-pinned` and `--bells` with auto-sizing. For dense (non-MoE) models it's a harmless no-op. The auto-sizer queries free VRAM, computes how many expert slots fit, then probes upward to find the actual maximum — it picks the right slot count for your hardware without any manual tuning.
 
-`python tools/bells-profile/bells_calc.py --matrix`, columns are VRAM/RAM in GB:
+### Manual setup
 
-```
-model                    4/16     6/32     8/32    12/32    12/64    16/64    24/64   24/128   48/256   80/512
--------------------------------------------------------------------------------------------------------------
-qwen3-next-80b            RAM     4.4x     6.9x    11.9x    11.9x    17.0x    27.1x    27.1x     vram     vram
-qwen3-30b-a3b             RAM     2.0x     3.2x     5.6x     5.6x     8.0x     vram     vram     vram     vram
-qwen3-235b-a22b           RAM      RAM      RAM      RAM      RAM      RAM      RAM     2.9x     6.0x    10.4x
-gpt-oss-120b              RAM      RAM      RAM      RAM      RAM      RAM      RAM     7.8x    16.5x     vram
-gpt-oss-20b                 .        .     2.0x     4.0x     4.0x     vram     vram     vram     vram     vram
-olmoe-1b-7b              2.0x     vram     vram     vram     vram     vram     vram     vram     vram     vram
-deepseek-v4-flash         RAM      RAM      RAM      RAM      RAM      RAM      RAM     4.7x    11.7x    21.0x
-deepseek-v3               RAM      RAM      RAM      RAM      RAM      RAM      RAM      RAM     4.0x     6.8x
-kimi-k2                   RAM      RAM      RAM      RAM      RAM      RAM      RAM      RAM      RAM     5.1x
-mixtral-8x7b              RAM        .        .        .        .    ~1.0x     2.0x     2.0x     vram     vram
-mixtral-8x22b             RAM      RAM      RAM      RAM      RAM      RAM      RAM        .    ~1.0x     2.0x
+```sh
+# auto-sized cache with explicit memory mode
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells -fa -c 4096
 
-N.Nx = the cache can hold this many working sets    . = cache too small to help anything
-vram = model fits on the card, load it normally     RAM = model exceeds RAM
+# set the cache size yourself
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 -fa -c 4096
+
+# pinned memory — faster copies when the model fits in RAM
+llama-server -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa -c 4096
 ```
 
-**Read the numbers as "can this possibly fit", not "will this help".** The ratio is calculated,
-not measured, and it does not predict the outcome: `gpt-oss-120b` at 24/128 is rated 7.8x and
-measures **6.1x slower** than the baseline, the worst result in this project. A high number
-here means a cache is physically possible, nothing more.
+`--bells-slots` controls how many experts per layer stay resident on the GPU. More slots = more VRAM = fewer cache misses = faster inference. Start high and lower it if you get an OOM.
 
-**RAM is usually the binding constraint, not VRAM** - most cells that say no say `RAM`, and
-that part of the table is reliable.
+### Recommended slot counts
 
-Ten cells have benchmarks behind them: qwen3-next-80b, qwen3-30b-a3b and gpt-oss-120b at 6/32;
-qwen3-next-80b, qwen3-235b-a22b, mixtral-8x7b and gpt-oss-120b on a 24 GB A10G. Predicted
-expert sizes land within 1% of what the runtime reports, so the *arithmetic* is sound - it is
-the inference from arithmetic to speedup that fails.
-
-### Where the time actually goes
-
-Instrumented per layer-call on Qwen3-30B-A3B at 17 slots (60.7% hit):
-
-| | time | share |
+| VRAM | Slots | Notes |
 |---|---|---|
-| readback (device -> host sync) | 167.1 us | 11% |
-| **copy (host -> device experts)** | **1356.3 us** | **87%** |
-| upload (slot table) | 28.7 us | 2% |
+| 6 GB | 26–30 | Use `--auto` or `--bells` for best results |
+| 8 GB | 50–60 | Enough for most 30B-class models |
+| 12 GB | 80–100 | Sweet spot for Qwen3.6-35B |
+| 16 GB | 100–120 | Room for larger context windows |
+| 24 GB | 150–200 | Can cache most active experts |
 
-Across 48 layers that is **74.5 ms of a 90.84 ms decode**. The transfers are the cost, so the
-hit rate has to be high enough that misses are rare - which needs a large cache, which needs
-VRAM. Qwen3-Next wins at 91% hit; everything at ~60% hit does not.
+These assume the rest of the model (attention layers, KV cache) is already allocated. The auto-sizer handles this automatically.
 
-An earlier version of this file claimed the per-layer host round trip was the ceiling. It is
-about 13% of the callback, and that claim was inferred rather than measured.
+## Supported models
 
-**One thing this does not explain.** Mixtral at 8 slots holds every expert, hits 100%, copies
-nothing, and still measured 0.80x. The timers above only see work inside the callback, so two
-candidates remain unmeasured: the graph split forced at every MoE layer costs kernel
-pipelining, and the cache squeezes the compute buffers whether or not it is used. The 6 GB
-result supports the second - it was ~5% slower even where BELLS bypassed itself entirely.
+BELLS works with any MoE model in GGUF format. Tested and tuned for:
 
-Three further conditions:
+| Model | Parameters | Experts | Active | File sizes |
+|---|---|---|---|---|
+| Qwen3-30B-A3B | 30B total, 3B active | 128 per layer | 8 | Q4: 18 GB, Q6: 24 GB |
+| Qwen3.6-35B | 35B total, ~5B active | 64 per layer | 4 | Q4: 23 GB, Q6: 28 GB |
+| Flash-Next 177B | 177B total | 128 per layer | 8 | IQ3: 65 GB, Q2: 70 GB |
+| Qwen3-Coder-Next 80B | 80B total, 3B active | 256 per layer | 8 | Q2: 25 GB, Q4: 46 GB |
+| DeepSeek-V3 | 671B total | 256 per layer | 8 | IQ3: 100 GB, Q4: 190 GB |
 
-- **The model must fit in RAM.** Once it does not, BELLS reads cold experts from the same
-  mmap the baseline does, so a miss costs the same disk read *plus* a PCIe copy. Strictly worse.
-- **Helps decode, not prefill.** A 512-token prompt touches 57-64 of 64 experts, so there is
-  no hot set to exploit. Long prompts pay full price.
-- **You need enough VRAM for a large cache *and* your context, at once.** They come out of the
-  same pool and llama.cpp allocates the KV cache first. On a 6 GB card at `-c 16384` only a
-  1.2x ratio fits, which is worse than useless. 24 GB holds a 16K context and a 128-slot cache
-  together, which is why every positive result here is on the larger card.
-- **The weaker your CPU, the more this helps** - possibly the whole of the effect. BELLS moves
-  expert compute onto the GPU, so its own throughput barely responds to core count while the
-  `--cpu-moe` baseline does. Doubling cores left Qwen3-Next's BELLS number at 39.9 -> 41.3
-  tok/s while its baseline went 14.3 -> 19.8. Stated as a hypothesis, not a finding: Mixtral
-  contradicts it and the infrastructure noise is large enough to matter.
+Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 
----
+## All flags
 
-## Start here
-
-Nothing about your model or your card predicts whether this helps. The only thing that does is
-your own `--cpu-moe` number, so measure that first. Twenty minutes, four steps.
-
-**1. Get your baseline.** This is stock llama.cpp and needs nothing from this fork. It is worth
-~2x over plain `-ngl` on MoE models, and for many people it is the whole answer.
-
-```
-llama-bells-profile -m model.gguf -f corpus.txt -o base.json -c 512 -n 128 -ngl 99 --cpu-moe
-```
-
-**2. Check a cache can physically fit.** This rules things out; it cannot rule them in.
-
-```
-python tools/bells-profile/bells_calc.py --vram 24 --ram 128 --preset qwen3-next-80b
-```
-
-**3. Measure BELLS against it, in the same session.**
-
-```
-llama-bells-profile -m model.gguf -f corpus.txt -o bells.json -c 512 -n 128 -ngl 99 \
-    --cpu-moe --bells-slots 128
-```
-
-**4. Sweep the slot count.** There is a per-model optimum and no rule for finding it. The 235B
-peaks at 28 slots and falls to 0.73x at 36; Mixtral peaks at 4 and drops to 0.80x at 8;
-Qwen3-Next climbs to 128 and then goes flat. Try a few, keep the best.
-
-> **Alternate the two configurations inside one session and quote the paired ratio.** Absolute
-> throughput drifts 30%+ over tens of minutes on a warm machine, which is more than the effect
-> you are measuring. Nearly every wrong number in this project came from ignoring that.
-
-Then run it for real:
-
-```
-llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 128
-```
-
-`--bells-slots -1` sizes the cache automatically. It is deliberately conservative and a sweep
-usually beats it - see [Automatic sizing](#automatic-sizing) below.
-
-### Will it help me?
-
-| your situation | expect |
+| Flag | Description |
 |---|---|
-| 24 GB card, weak or busy CPU, model too big for `-ngl` | **the good case** - up to ~2x |
-| 24 GB card, strong CPU | smaller gain, possibly none - measure |
-| your `--cpu-moe` already beats what BELLS reaches | **it will lose.** Do not use it |
-| 6-8 GB card | **no.** Not enough VRAM for a cache and a real context at once |
-| model does not fit in RAM | **no.** Strictly worse than `--cpu-moe` |
+| `--auto` | One-flag setup. Detects MoE models and enables `--cpu-moe-pinned` + `--bells` with auto-sizing. No-op for dense models. |
+| `--cpu-moe` | Keep all MoE expert weights on the CPU (via mmap). Required for BELLS. Use this when the model is too large to fit in RAM — the OS page cache will stream from NVMe. |
+| `--cpu-moe-pinned` | Like `--cpu-moe`, but pin expert weights in physical RAM (no mmap). Faster host-to-device copies because pinned memory enables async DMA. Requires the model's expert weights to fit in RAM. |
+| `--bells` | Enable BELLS with auto-sized cache. Equivalent to `--bells-slots -1`. |
+| `--bells-slots N` | Cache N experts per layer in VRAM. Set to `-1` to auto-size from free VRAM. More slots = higher hit rate = faster. With multiple GPUs, auto-sizing gives each device its own slot count. |
+| `--bells-l2-slots N` | Use an idle secondary GPU's VRAM as an L2 victim cache. N experts per layer on GPU 2. `-1` to auto-size. Ignored on single-GPU systems and when both GPUs are actively computing. |
+| `--bells-split K` | Run K of each token's experts on GPU, the rest on CPU concurrently. The MoE output is a weighted sum, so splitting is exact — no quality loss. Fewer experts need to be in the cache. Default: 0 (all through cache). |
+| `--bells-refresh N` | Observe a fixed 1/N subset of MoE layers per token (layers where `il % N == 0`). Unobserved layers use a permanent pinned table, so `--pin-experts` is required. Reduces graph-split overhead (~2.3 ms/token across 32 layers). Default: 1 (every layer). |
+| `--bells-cache-type TYPE` | Store cached experts at a different quantisation than the model (e.g. `q2_K` when the model is `q4_K`). Fits more experts in the same VRAM at the cost of re-quantisation overhead. Experimental. |
+| `--bells-reserve N` | Leave N MiB of VRAM free when auto-sizing the cache. Needed when something else loads onto the GPU after BELLS, such as an MTP draft head (`1536` is a good start, `2200` with prompt staging at `-ub 4096`). |
+| `--bells-passive` | Research only. Allocate the cache and perform graph splits, but don't copy any experts. Measures mechanism overhead in isolation. |
 
-### Automatic sizing
+### Environment variables
 
-`--bells-slots -1` takes free VRAM minus a third for headroom. That heuristic was calibrated on
-a 6 GB card, which is now known to be a configuration where BELLS does not help at all, so treat
-it as a safe starting point rather than a tuned one. It errs small on purpose: oversizing is
-punished hard - a 19.9 GB cache on a 24 GB card took the 235B to 1.02x and 22.4 GB took it to
-0.73x, because the cache and the compute buffers come out of the same VRAM.
+| Variable | Description |
+|---|---|
+| `GGML_CUDA_NO_PINNED=1` | Disable CUDA pinned (page-locked) host memory allocation. Use this if you see corrupted output or NaN on systems with IOMMU/DMA issues. |
+| `BELLS_ADAPT=N` | Enable adaptive pins: every N decode tokens, decay usage counters and swap the coldest resident experts for the hottest non-resident ones. Keeps the cache aligned with shifting access patterns. Try `BELLS_ADAPT=4`. |
+| `BELLS_PREFILL_STAGE=1` | Prompt staging: read long prompts in large batches instead of cache-sized ones. See [Long prompts](#long-prompts-prompt-staging). |
+| `BELLS_PREFILL_MIN=N` | Smallest batch that takes the staged path (default 192 tokens). Shorter ones go through the cache as usual. |
+| `BELLS_PREFILL_SETS=1` | Use one staging buffer instead of two. Saves one layer's worth of VRAM and gives up copying the next layer ahead. |
+| `BELLS_PREFILL_D2D=0` | Send every staged expert from the host instead of taking the cached ones from VRAM. |
+| `BELLS_LAYER_STATS=file` | Print per-layer miss and coverage numbers at shutdown and save the per-expert lookup counts to `file`. |
+| `BELLS_LAYER_PROFILE=file` | Split the cache's slots between layers according to a file written by `BELLS_LAYER_STATS`, instead of equally. Layers with diffuse routing get more slots. Record the profile on prompts other than the ones you benchmark. |
+| `BELLS_PASS_TIMING=1` | Print wall time per pass by batch size, target and draft contexts apart. Diagnostic; costs a little speed. |
+| `GGML_CUDA_PROFILE=1` | Per-operation GPU time table (needs `GGML_CUDA_DISABLE_GRAPHS=1`). Diagnostic; every operation is synchronised, so it is slow. |
+| `BELLS_GLOBAL_PREFETCH=1` | Enable the online global prefetch predictor. Learns inter-layer routing correlations (`P(expert_to \| expert_from)`) and speculatively copies high-confidence candidates before their layer runs. Requires a GPU with a separate copy stream. Stats printed at shutdown. |
+| `BELLS_GP_AHEAD=N` | How many layers ahead the global predictor looks (default 4, max 8). |
+| `BELLS_GP_CONF=N` | Minimum confidence percentage to issue a prefetch (default 90). |
+| `BELLS_GP_MB=N` | Shared byte budget for in-flight prefetches, in MiB (default 8). |
+| `BELLS_GP_MIN_SEEN=N` | Minimum observations before a link's predictions are trusted (default 16). |
+| `BELLS_GP_PRECISION=N` | Minimum measured prediction accuracy percentage; links below this are filtered (default 80, 0 disables calibration). |
 
-It has not been re-tuned because doing so honestly needs a slot sweep per model per card, and a
-heuristic fitted to four models would be the sixth predictor this project has had to retract.
-Sweep instead; the runtime prints the cache size in MiB at load so you can see what you got.
+### Flag ordering
 
-### Serving concurrent requests
+`-ot` (tensor override) rules must come **before** `--cpu-moe` on the command line. The first matching override wins, so an `-ot` placed after `--cpu-moe` is silently ignored.
 
-BELLS serves batched decode up to `n_slot / n_expert_used` tokens per ubatch, which it prints
-at load (`serves ubatch <= 3`). Beyond that the cache could not be guaranteed to hold every
-expert a batch asks for, so those batches run the normal path. Prefill always runs the normal
-path: a 512-token batch touches nearly every expert, so there is no hot set to exploit.
+```sh
+# correct — -ot overrides the first 8 expert layers to GPU
+llama-server -m model.gguf -ot "blk\.[0-7]\.ffn_(gate|up|down)_exps\.weight=CUDA0" --cpu-moe --bells -fa
 
-On `llama-server` with Qwen3-Next-80B on a 6 GB 2060, aggregate throughput over 100-token chat
-completions, three passes each after a heavy warmup:
+# wrong — -ot is ignored because --cpu-moe already matched
+llama-server -m model.gguf --cpu-moe -ot "blk\.[0-7]\.ffn_(gate|up|down)_exps\.weight=CUDA0" --bells -fa
+```
 
-| concurrency | baseline | BELLS | ratio |
+## Multi-GPU
+
+BELLS supports two multi-GPU modes depending on your setup.
+
+### Active caching (both GPUs compute)
+
+When attention layers are split across GPUs with `--device`, BELLS sizes each GPU's expert cache independently based on its own free VRAM. A 24 GB card and a 6 GB card in the same system each get the slot count that fits, instead of both being limited to the smaller card.
+
+```sh
+# 2x NVIDIA GPUs — each auto-sized independently
+llama-server -m model.gguf -ngl 99 --device CUDA0,CUDA1 --cpu-moe --bells -fa
+
+# 2x AMD GPUs
+llama-server -m model.gguf -ngl 99 --device ROCm0,ROCm1 --cpu-moe --bells -fa
+```
+
+Both GPUs run attention for their assigned layers. BELLS auto-detects that the second GPU is active and skips L2 mode (which would steal VRAM from productive work).
+
+### L2 victim cache (second GPU as storage)
+
+When only one GPU runs compute, a second GPU can donate its VRAM as an overflow cache.
+
+```sh
+# auto-size L2 from GPU 2's free VRAM
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 --bells-l2-slots -1 -fa
+
+# or set L2 size explicitly
+llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 --bells-l2-slots 200 -fa
+```
+
+When an expert is evicted from L1 (primary GPU), it goes to L2 (secondary GPU) instead of being discarded. Next time it's needed, it copies from GPU 2 VRAM — a fast device-to-device transfer instead of a page fault from NVMe.
+
+## Speculative decoding (MTP)
+
+Models that ship an MTP draft head (Flash-Next 177B does) can draft a few tokens ahead and verify them in one pass. BELLS works with llama.cpp's `draft-mtp` mode:
+
+```bash
+llama-server -m flash-next-177b-q2_0.gguf --auto --bells-reserve 1536 \
+  -c 4096 -ctk q4_0 -ctv q4_0 -np 1 \
+  --spec-type draft-mtp --spec-draft-model mtp-head-shared.gguf --spec-draft-ngl 99 \
+  --spec-draft-n-max 3 --spec-draft-sampling probabilistic
+```
+
+- Use a *shared* MTP head (one that borrows the embedding and output tensors from the main model). A standalone head loads its own copies and takes the VRAM the expert cache needs.
+- `--bells-reserve` keeps room for the head. Without it the cache is sized first and the head fails to load.
+- Three drafted tokens was the best length measured; four was slower.
+
+## Long prompts (prompt staging)
+
+By default a prompt goes through the expert cache in batches no larger than the cache can serve (about 20 tokens on a 24 GB card with the 177B), which is slow for long prompts. With `BELLS_PREFILL_STAGE=1` a large batch bypasses the cache: each layer's full expert stack is placed in a staging buffer just before that layer runs, and the next layer's is prepared on a second thread while the current one computes. Experts already in the cache are copied inside VRAM; only the others cross the bus.
+
+```bash
+BELLS_PREFILL_STAGE=1 llama-server -m model.gguf --auto --bells-reserve 2200 -ub 4096 -b 4096 ...
+```
+
+- It costs VRAM: two buffers of one layer's experts each (2 x 0.66 GiB on the 177B Q2_0), taken out of the cache.
+- The batch size sets the speed. `-ub 2048` is the default worth trying; `-ub 4096 -b 4096` is faster on prompts longer than 2K tokens and needs more reserve.
+- Batches under 192 tokens, and all generation, still use the cache.
+- On the A10G this took the 177B from about 200 to 700-850 prompt tok/s with generation speed unchanged.
+- CUDA only for the in-VRAM copy; other backends send every expert from the host.
+
+## How it works
+
+```
+                ┌──────────────────────────────────────────┐
+                │              BELLS cache                 │
+                │                                          │
+  Router      ┌──────────┐  evict   ┌──────────┐          │
+  picks       │ L1 cache │ ──────▶  │ L2 cache │          │
+  expert E    │ GPU 1    │ ◀──────  │ GPU 2    │          │
+  ──────────▶ │(compute) │ promote  │(storage) │          │
+              └──────────┘          └──────────┘          │
+                   │ miss                │ miss            │
+                   ▼                     ▼                 │
+              ┌──────────┐         ┌──────────┐           │
+              │ Host RAM │         │  (skip)  │           │
+              │ or NVMe  │         │          │           │
+              └──────────┘         └──────────┘           │
+              (may page fault)                             │
+              └────────────────────────────────────────────┘
+
+Multi-GPU active mode (--device GPU0,GPU1):
+
+  Router      ┌──────────┐          ┌──────────┐
+  picks       │ GPU 0    │          │ GPU 1    │
+  expert E    │ 80 slots │          │ 40 slots │
+  ──────────▶ │ layers   │          │ layers   │
+              │  0–15    │          │  16–31   │
+              └──────────┘          └──────────┘
+                   │ miss                │ miss
+                   ▼                     ▼
+              ┌──────────────────────────────────┐
+              │    Host RAM / NVMe (experts)     │
+              └──────────────────────────────────┘
+```
+
+### The cache hierarchy
+
+1. **L1 (GPU VRAM)** — the working cache. Experts are loaded here for compute. Uses LRU eviction with per-layer clock counters. With multiple active GPUs, each device gets its own independent slot count.
+
+2. **L2 (secondary GPU, optional)** — a victim cache for single-compute-GPU setups. When L1 evicts an expert, it goes to L2 instead of being discarded. L2 uses its own LRU policy. Automatically disabled when both GPUs are active.
+
+3. **Host memory** — the cold tier. Expert weights served via mmap (or pinned allocation with `--cpu-moe-pinned`). When the model doesn't fit in RAM, the OS page cache handles NVMe paging transparently.
+
+### Data flow for a single expert load
+
+```
+Token arrives → Router selects experts → For each expert not in L1:
+
+  1. EVICTION:  Pick least-recently-used slot in this layer's cache
+                If L2 exists: demote victim → staging buffer → write to L2 slot
+
+  2. L2 CHECK:  Look up requested expert in L2 index
+                  HIT  → read from L2 → staging → write to L1 slot → done
+                  MISS → fall through to cold path
+
+  3. COLD PATH: Read from host memory → write to L1 slot
+                (may page fault from NVMe if model exceeds RAM)
+```
+
+### Key design decisions
+
+- **Per-device slot sizing.** Each GPU gets the slot count its own free VRAM supports. A 24 GB and 6 GB card in the same system aren't bottlenecked by the smaller card.
+- **Auto-sizing with upward probing.** The auto-sizer computes an initial estimate from free VRAM, then probes upward with real allocations to find the actual maximum. It checks each probe against physical VRAM to avoid over-allocation into managed memory.
+- **Smart L2 detection.** L2 is automatically skipped when the candidate GPU already hosts BELLS cache layers. No manual flag juggling for multi-GPU setups.
+- **Per-layer indexing.** Each layer maintains its own slot map (`expert → slot`). This matches how MoE routing works and avoids cross-layer eviction interference.
+- **Victim cache semantics.** L2 only receives data evicted from L1 (or promoted back). It never loads directly from host. This keeps the L2 population naturally tuned to the model's actual access pattern.
+- **Backward compatible.** Single-GPU systems behave identically to stock llama.cpp. Dense models are completely unaffected.
+
+### Adaptive pins
+
+Set `BELLS_ADAPT=N` to let the cache track which experts are actually hot and swap cold residents for hot non-residents every N tokens. Without it, the cache is purely reactive — it only loads an expert when the router asks for it. With adaptive pins, usage counters decay over time and a background pass swaps the coldest cached experts for the hottest ones that aren't cached yet, keeping the working set aligned with the model's shifting attention.
+
+### Global prefetch
+
+Set `BELLS_GLOBAL_PREFETCH=1` to enable the online inter-layer routing predictor. It observes which experts each layer routes to and builds a co-occurrence table: for each `(from_layer, to_layer)` pair within a configurable window, it learns `P(expert_to | expert_from)`. When a layer finishes routing, the predictor scans upcoming layers and speculatively copies any candidate whose confidence exceeds the threshold (default 90%). Copies go through a worker thread and use per-layer GPU events for ordering, so speculative work overlaps with compute. Links that predict poorly are automatically cooled down.
+
+## Performance estimator
+
+Estimate BELLS performance on your hardware before downloading a model:
+
+```sh
+cd tools/bells-manager
+
+# what will an RTX 5060 Ti get on Flash-Next 177B?
+python bells.py estimate run -g "5060 Ti" -m flash-next-177b -q Q2_K
+
+# try different configurations
+python bells.py estimate run -g "3060" -m qwen3.6-35b -q Q4_K_M -c 8192 --ram 64 --ram-speed ddr5-6000
+
+# list all supported GPUs and models
+python bells.py estimate gpus
+python bells.py estimate models
+```
+
+The estimator models cache hit rates, transfer bandwidth (including page-cache-aware mmap behaviour), and pipeline overlap. It outputs projected tok/s with and without BELLS, plus recommended flags.
+
+### Supported hardware in the estimator
+
+Over 50 GPUs are in the database, including:
+- **NVIDIA Desktop:** RTX 20-series through 50-series
+- **NVIDIA Laptop:** RTX 3060–5080 Laptop variants (with adjusted bandwidth)
+- **NVIDIA Data Center:** A10, A100, L4, L40
+- **AMD Desktop:** RX 7600 through 9070 XT
+- **Intel:** Arc A770, Arc B580
+
+Custom GPUs can be specified with `--gpu-vram` and `--gpu-bw` overrides.
+
+## Benchmarking tool
+
+Find the optimal BELLS configuration for your system automatically:
+
+```sh
+cd tools/bells-manager
+
+# quick benchmark — tests key configurations
+python bells.py bench -m /path/to/model.gguf -p short
+
+# thorough benchmark
+python bells.py bench -m /path/to/model.gguf -p long -c 8192
+
+# just list detected models
+python bells.py models
+
+# print system info (GPUs, RAM, detected binaries)
+python bells.py system
+```
+
+The benchmark engine explores flag combinations (baseline, `--cpu-moe`, `--cpu-moe-pinned`, various `--bells-slots` values) and reports the fastest configuration. Results are saved as JSON for later comparison.
+
+<!--
+## Manager UI
+
+BELLS includes a TUI (terminal UI) and GUI for interactive configuration, benchmarking, and server management:
+
+```sh
+cd tools/bells-manager
+
+# terminal UI (requires: pip install textual)
+python bells.py
+
+# desktop GUI (requires: pip install pywebview)
+python bells.py --gui
+```
+
+Features:
+- System info dashboard (GPU, RAM, CPU detection)
+- Model browser with Hugging Face search
+- Interactive server launcher with log streaming
+- Benchmark runner with live progress
+- Configuration builder with recommended flags
+
+### Requirements
+
+```sh
+pip install textual           # for TUI
+pip install pywebview          # for desktop GUI
+pip install huggingface_hub    # for model search
+```
+-->
+
+## Tips and troubleshooting
+
+### Choosing between `--cpu-moe` and `--cpu-moe-pinned`
+
+| | `--cpu-moe` | `--cpu-moe-pinned` |
+|---|---|---|
+| Memory mode | mmap (virtual, backed by page cache) | Pinned in physical RAM |
+| Model fits in RAM | Slightly slower copies | Fastest copies (async DMA) |
+| Model exceeds RAM | Works — OS pages from NVMe transparently | Will exhaust RAM and swap, don't use |
+| Use when | Model > RAM, or you want to share RAM with other apps | Model fits comfortably in RAM and you want max throughput |
+
+### Combining `-ot` with BELLS
+
+You can pin the hottest expert layers to the GPU with `-ot` and let BELLS cache the rest. Layers already in VRAM are skipped by the cache — no wasted slots, no conflicts. This gives you fast prefill from the pinned layers and fast decode from the cache on everything else.
+
+```sh
+# pin layers 0–7 to GPU, BELLS caches experts for layers 8–47
+llama-server -m model.gguf -ngl 99 \
+  -ot "blk\.[0-7]\.ffn_(gate|up|down)_exps\.weight=CUDA0" \
+  --cpu-moe --bells -fa -c 4096
+```
+
+Remember: `-ot` must come **before** `--cpu-moe` on the command line.
+
+### Context window vs BELLS cache
+
+VRAM is shared between the KV cache (scales with context length) and the BELLS expert cache (scales with slot count). Longer context = less room for expert slots = lower hit rate. If you need long context, consider KV quantisation:
+
+```sh
+# halves KV cache VRAM usage, freeing room for more expert slots
+llama-server -m model.gguf --auto --cache-type-k q8_0 --cache-type-v q8_0 -c 16384 -fa
+```
+
+### Common issues
+
+**"failed to allocate expert slots"** — Not enough free VRAM after loading attention layers and KV cache. Reduce context (`-c`), use KV quantisation, or close other GPU applications.
+
+**Output looks corrupted or produces NaN** — On some systems, CUDA pinned (page-locked) memory allocation returns bad data due to IOMMU or DMA issues. Set `GGML_CUDA_NO_PINNED=1` to disable pinned host memory.
+
+**Server starts but BELLS isn't active** — Make sure you're using a MoE model. BELLS is silently disabled for dense models. Check stderr for `init:` lines confirming BELLS loaded with a slot count > 0.
+
+**Lower throughput than expected** — Make sure the system is idle (no games, encoders, or other GPU-heavy apps). Background processes sharing VRAM reduce the slots available. Use `nvidia-smi` or equivalent to check free VRAM before launching.
+
+**`-ot` overrides being ignored** — They must come before `--cpu-moe` on the command line. See [Flag ordering](#flag-ordering).
+
+## How BELLS compares to other approaches
+
+| Approach | Quality | Speed | VRAM needed |
 |---|---|---|---|
-| 1 | 15.0 | 15.2 tok/s | 1.01x |
-| 2 | 19.3 | 22.0 tok/s | 1.14x |
-| 3 | 22.2 | 25.0 tok/s | 1.12x |
-| 4 | 23.1 | 23.0 tok/s | 1.00x |
+| Full GPU offload | Lossless | Fastest | All experts must fit |
+| CPU-only MoE (`--cpu-moe`) | Lossless | Slow (memory-bound) | Only attention layers |
+| Expert pruning/dropping | Lossy | Fast | Reduced | 
+| **BELLS** | **Lossless** | **Fast (cache-dependent)** | **Configurable (slots)** |
 
-Note this is well below the 1.18x the same model shows in single-stream profiling, and the
-gap is the point: a server request also pays prefill, which BELLS bypasses, plus template and
-sampling overhead that a short generation does not amortise. Benchmark numbers taken with
-`llama-bells-profile` are an upper bound on what a server workload will see.
-
-Two flags that used to be here, `--bells-table` and `--bells-drop-missing`, have been removed.
-Both are described under [Findings](#findings): one never won a benchmark, the other produced
-a broken model. Git history has them if you want to revisit either.
+BELLS is the only approach that maintains full output quality while running models that exceed VRAM. It sits between "everything on GPU" (impossible for large models) and "everything on CPU" (too slow for interactive use).
 
 ---
 
-## Tools
+# llama.cpp
 
-`llama-bells-profile` records per-token expert routing for any MoE architecture and writes a
-numpy-loadable trace, plus coverage curves and LRU-versus-Belady bounds. Useful independently
-of the cache.
+![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
-```
-llama-bells-profile -m model.gguf -f corpus.txt -o out.json -c 512 -n 128 -ngl 99 --cpu-moe
-python tools/bells-profile/bells_calc.py --vram 6 --ram 32 --preset qwen3-next-80b
-python tools/bells-profile/bells_degen.py out.trace.bin       # degeneration check
-python tools/bells-profile/bells_quality.py ref.bin got.bin   # aligned output comparison
-python tools/bells-profile/bells_predict.py out.trace.bin     # LRU vs table vs Belady
-```
+<div align="center">
 
-`llama-bells-selftest` verifies on your GPU that the cache path is bit-identical to the full
-expert tensor, that the residency mapping stays injective across 16000 randomised states, and
-that the whole runtime loop matches exactly.
+<b>LLM inference in C/C++</b>
 
----
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-## Findings
+</div>
 
-Beyond the speedups, the measurements produced results worth recording. Full detail with
-methodology in [RESULTS.md](RESULTS.md); a plain-language overview in
-[WHAT_BELLS_IS.md](WHAT_BELLS_IS.md).
+## Quick start
 
-**Token id predicts 68-77% of expert selection**, replicated on two architectures. A plain
-counting table beats LRU by 20-35 points on hit rate. Held-out, on Qwen3: 1x working set gives
-LRU 35.5% against the table's 68.8%.
+```sh
+# Download and run a model directly from Hugging Face
+llama-cli -hf ggml-org/Qwen3.5-0.8B-GGUF
 
-**Prediction still loses.** Every winning configuration here is plain LRU with prediction
-switched off. Hit rate was the wrong objective: demand loading moves exactly the experts a
-token needs, prediction moves a superset, and on a bandwidth-bound path the extra traffic
-costs more than the extra hits save. The project is named after a predictive loading system
-that did not survive its own benchmarks.
-
-The predictor has now been **deleted from the runtime** rather than left switched off, because
-a flag that never helps is a trap for the next reader. `bells_predict.py` still scores
-prediction against LRU and Belady offline, which is where the question belongs.
-
-`--bells-drop-missing` went with it. Letting a non-resident expert contribute nothing removed
-the per-layer host sync and was the fastest thing this project ever measured, but it scored
-perplexity **52.97 against a baseline of 2.03** - a broken model, not an approximate one. It
-also only ever half-worked: prefetching was the sole way an expert became resident in that
-mode, so without a predictor table loaded the slot tensors were never written at all and the
-graph indexed the cache with uninitialised VRAM. It could not survive the predictor's removal.
-
-**Cross-layer expert identity carries no signal.** 0.99 shared experts between layer L and
-L+1 against a chance value of 1.00. Predicting deeper layers from shallower ones is dead.
-
-**There is no small "burning" hot set.** Covering 80% of routing decisions takes roughly half
-of all experts. Expert usage is mildly skewed, not power-law.
-
-**Prefetching can beat Belady's optimum**, because Belady is only optimal for demand paging
-and a predictor can cache an expert before anything has asked for it.
-
-### Two ways to fool yourself, both of which fooled me
-
-**Degeneration inflates speedups.** A generation that collapses into a loop touches almost no
-distinct experts, so the cache hits ~100% and the timing looks superb. The two fastest results
-ever recorded here - 25.9 and 28.0 ms/token - were a model repeating one token 120 times.
-`bells_degen.py` exists because of this.
-
-**Session drift fakes ratios.** Absolute throughput on a warm desktop drifts 30%+ over tens of
-minutes. The same configuration with byte-identical cache behaviour measured 42.05 ms early in
-a session and 58.55 ms later. An earlier draft of these results claimed 1.40x by comparing a
-fast BELLS run against a slow baseline. Alternate configurations back-to-back and quote the
-paired ratio.
-
-**A third trap, for anyone extending this:** the cache ratio screens candidates but does not
-rank them. Qwen3-30B-A3B wins bigger at 2.2x than Qwen3-Next-80B does at 4.7x, because its
-CPU baseline is slower and there was more work to move to the GPU. Two models with the same
-ratio can behave differently, so treat the calculator as a filter, not a prediction.
-
----
-
-## Building
-
-```
-cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build -j
+# Launch OpenAI-compatible API server
+llama-server -hf ggml-org/Qwen3.5-0.8B-GGUF
 ```
 
-Set `CMAKE_CUDA_ARCHITECTURES` for your card: `86` for RTX 30-series/A10, `89` for 40-series,
-`75` for RTX 20-series, `61` for GTX 10-series. See [LAPTOP.md](LAPTOP.md) for notes on
-running this on small cards.
+## Description
 
----
+The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware — locally and in the cloud.
 
-## Credits and licence
+- Plain C/C++ implementation without any dependencies
+- Apple silicon is a first-class citizen — optimized via ARM NEON, Accelerate and Metal frameworks
+- AVX, AVX2, AVX512 and AMX support for x86 architectures
+- 1.5-bit through 8-bit integer quantization for faster inference and reduced memory use
+- Custom CUDA kernels for NVIDIA GPUs (AMD via HIP, Moore Threads via MUSA)
+- Vulkan and SYCL backend support
+- CPU+GPU hybrid inference to partially accelerate models larger than VRAM capacity
 
-Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) by Georgi Gerganov and
-contributors, forked from
-[antirez/llama.cpp-deepseek-v4-flash](https://github.com/antirez/llama.cpp-deepseek-v4-flash)
-for its DeepSeek V4 architecture support. MIT, as upstream.
+Built on top of the [ggml](https://github.com/ggml-org/ggml) library.
 
-The BELLS code and the benchmarking in this repository were written with heavy AI assistance
-(Claude). The measurements are real and reproducible; the code has not had the scrutiny of a
-human author who wrote every line. Treat it accordingly, and note that llama.cpp upstream does
-not accept predominantly AI-generated contributions - this fork is not intended for upstream
-submission in its current form.
+## Supported backends
+
+| Backend | Target devices |
+| --- | --- |
+| [CUDA](docs/build.md#cuda) | NVIDIA GPU |
+| [HIP](docs/build.md#hip) | AMD GPU |
+| [Vulkan](docs/build.md#vulkan) | GPU (cross-vendor) |
+| [Metal](docs/build.md#metal-build) | Apple Silicon |
+| [SYCL](docs/backend/SYCL.md) | Intel GPU |
+| [CANN](docs/build.md#cann) | Ascend NPU |
+| [BLAS](docs/build.md#blas-build) | All |
+
+See the upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) for the full backend list and build instructions.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

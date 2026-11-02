@@ -127,6 +127,12 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    # EXL3 kernels use mma instructions that require sm_80+. Keep the rest of
+    # the backend available on older architectures, but compile this file for
+    # sm_86 only. A runtime call on unsupported hardware returns a CUDA error.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/exl3.cu"
+        PROPERTIES CUDA_ARCHITECTURES "86")
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}

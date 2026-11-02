@@ -1,10 +1,10 @@
-# BELLS
+﻿# BELLS
 
 **Run 177B models on consumer GPUs. No quality loss.**
 
 BELLS (**B**uffered **E**xpert **L**oading with **L**ayered **S**lots) is a [llama.cpp](https://github.com/ggml-org/llama.cpp) fork that adds a per-layer VRAM expert cache for Mixture-of-Experts models. Instead of keeping all experts in VRAM (impossible on consumer cards) or running them entirely on the CPU (slow), BELLS caches the hot experts on your GPU and streams the rest from RAM or NVMe on demand.
 
-Every expert the router picks still gets computed on the GPU — nothing is skipped, pruned, or approximated. With the default cache path, output is bit-identical to full-GPU inference. Optional modes like `--bells-cache-type` (re-quantisation) and `--bells-split` (CPU/GPU split) change precision by design.
+Every expert the router picks still gets computed on the GPU â€” nothing is skipped, pruned, or approximated. With the default cache path, output is bit-identical to full-GPU inference. Optional modes like `--bells-cache-type` (re-quantisation) and `--bells-split` (CPU/GPU split) change precision by design.
 
 ## EXL3
 
@@ -38,9 +38,9 @@ After installation, run `bells system` to verify your setup.
 
 ### Requirements
 
-- **Python 3.10+** — for the installer and tools
-- **Git** — for cloning the repository
-- **CMake** — only needed if building from source (no precompiled binary for your platform)
+- **Python 3.10+** â€” for the installer and tools
+- **Git** â€” for cloning the repository
+- **CMake** â€” only needed if building from source (no precompiled binary for your platform)
 - **GPU SDK** (one of):
   - NVIDIA: [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)
   - AMD: [ROCm](https://rocm.docs.amd.com/) (Linux) or Vulkan SDK
@@ -73,12 +73,12 @@ cmake --build build --config Release
 |---|---|---|---:|---:|---:|
 | Qwen3.6-35B Q4 | RTX 3060 12 GB | 32 GB DDR4 | 32.5 tok/s | **60.9 tok/s** | 1.9x |
 | Qwen3.6-35B Q6 | RTX 3060 12 GB | 32 GB DDR4 | 22.1 tok/s | **42.8 tok/s** | 1.9x |
-| Qwen3.6-35B Q4 | RTX 2060 6 GB | 32 GB DDR4 | — | **36.3 tok/s** | — |
+| Qwen3.6-35B Q4 | RTX 2060 6 GB | 32 GB DDR4 | â€” | **36.3 tok/s** | â€” |
 | Qwen3-30B-A3B Q4 | RTX 2060 6 GB | 32 GB DDR4 | 22.4 tok/s | **28.3 tok/s** | 1.3x |
 | Flash-Next 177B Q2 | RTX 3060 12 GB | 32 GB DDR4 | 14.7 tok/s | **32.9 tok/s** | 2.2x |
-| Qwen3-Coder-Next 80B Q2 | RTX 2060 6 GB | 32 GB DDR4 | — | **27.2 tok/s** | — |
+| Qwen3-Coder-Next 80B Q2 | RTX 2060 6 GB | 32 GB DDR4 | â€” | **27.2 tok/s** | â€” |
 
-Models streamed from NVMe via mmap. The 177B model (65 GB quantised) doesn't even fit in 32 GB RAM — the page cache handles it transparently. Coder-Next at 64k context: 20.8 tok/s; at 131k: 19.3 tok/s.
+Models streamed from NVMe via mmap. The 177B model (65 GB quantised) doesn't even fit in 32 GB RAM â€” the page cache handles it transparently. Coder-Next at 64k context: 20.8 tok/s; at 131k: 19.3 tok/s.
 
 "Without BELLS" means `--cpu-moe -ngl 99` (all attention on GPU, all experts on CPU). The baseline for models that don't fit in VRAM at all is CPU-only, which is far slower.
 
@@ -107,7 +107,7 @@ llama-server -m model.gguf --auto -c 4096 -fa
 llama-cli    -m model.gguf --auto -c 4096
 ```
 
-`--auto` enables `--cpu-moe-pinned` and `--bells` with auto-sizing. For dense (non-MoE) models it's a harmless no-op. The auto-sizer queries free VRAM, computes how many expert slots fit, then probes upward to find the actual maximum — it picks the right slot count for your hardware without any manual tuning.
+`--auto` enables `--cpu-moe-pinned` and `--bells` with auto-sizing. For dense (non-MoE) models it's a harmless no-op. The auto-sizer queries free VRAM, computes how many expert slots fit, then probes upward to find the actual maximum â€” it picks the right slot count for your hardware without any manual tuning.
 
 ### Manual setup
 
@@ -118,7 +118,7 @@ llama-server -m model.gguf -ngl 99 --cpu-moe --bells -fa -c 4096
 # set the cache size yourself
 llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 -fa -c 4096
 
-# pinned memory — faster copies when the model fits in RAM
+# pinned memory â€” faster copies when the model fits in RAM
 llama-server -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa -c 4096
 ```
 
@@ -128,11 +128,11 @@ llama-server -m model.gguf -ngl 99 --cpu-moe-pinned --bells-slots 80 -fa -c 4096
 
 | VRAM | Slots | Notes |
 |---|---|---|
-| 6 GB | 26–30 | Use `--auto` or `--bells` for best results |
-| 8 GB | 50–60 | Enough for most 30B-class models |
-| 12 GB | 80–100 | Sweet spot for Qwen3.6-35B |
-| 16 GB | 100–120 | Room for larger context windows |
-| 24 GB | 150–200 | Can cache most active experts |
+| 6 GB | 26â€“30 | Use `--auto` or `--bells` for best results |
+| 8 GB | 50â€“60 | Enough for most 30B-class models |
+| 12 GB | 80â€“100 | Sweet spot for Qwen3.6-35B |
+| 16 GB | 100â€“120 | Room for larger context windows |
+| 24 GB | 150â€“200 | Can cache most active experts |
 
 These assume the rest of the model (attention layers, KV cache) is already allocated. The auto-sizer handles this automatically.
 
@@ -155,12 +155,12 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 | Flag | Description |
 |---|---|
 | `--auto` | One-flag setup. Detects MoE models and enables `--cpu-moe-pinned` + `--bells` with auto-sizing. No-op for dense models. |
-| `--cpu-moe` | Keep all MoE expert weights on the CPU (via mmap). Required for BELLS. Use this when the model is too large to fit in RAM — the OS page cache will stream from NVMe. |
+| `--cpu-moe` | Keep all MoE expert weights on the CPU (via mmap). Required for BELLS. Use this when the model is too large to fit in RAM â€” the OS page cache will stream from NVMe. |
 | `--cpu-moe-pinned` | Like `--cpu-moe`, but pin expert weights in physical RAM (no mmap). Faster host-to-device copies because pinned memory enables async DMA. Requires the model's expert weights to fit in RAM. |
 | `--bells` | Enable BELLS with auto-sized cache. Equivalent to `--bells-slots -1`. |
 | `--bells-slots N` | Cache N experts per layer in VRAM. Set to `-1` to auto-size from free VRAM. More slots = higher hit rate = faster. With multiple GPUs, auto-sizing gives each device its own slot count. |
 | `--bells-l2-slots N` | Use an idle secondary GPU's VRAM as an L2 victim cache. N experts per layer on GPU 2. `-1` to auto-size. Ignored on single-GPU systems and when both GPUs are actively computing. |
-| `--bells-split K` | Run K of each token's experts on GPU, the rest on CPU concurrently. The MoE output is a weighted sum, so splitting is exact — no quality loss. Fewer experts need to be in the cache. Default: 0 (all through cache). |
+| `--bells-split K` | Run K of each token's experts on GPU, the rest on CPU concurrently. The MoE output is a weighted sum, so splitting is exact â€” no quality loss. Fewer experts need to be in the cache. Default: 0 (all through cache). |
 | `--bells-refresh N` | Observe a fixed 1/N subset of MoE layers per token (layers where `il % N == 0`). Unobserved layers use a permanent pinned table, so `--pin-experts` is required. Reduces graph-split overhead (~2.3 ms/token across 32 layers). Default: 1 (every layer). |
 | `--bells-cache-type TYPE` | Store cached experts at a different quantisation than the model (e.g. `q2_K` when the model is `q4_K`). Fits more experts in the same VRAM at the cost of re-quantisation overhead. Experimental. |
 | `--bells-reserve N` | Leave N MiB of VRAM free when auto-sizing the cache. Needed when something else loads onto the GPU after BELLS, such as an MTP draft head (`1536` is a good start, `2200` with prompt staging at `-ub 4096`). |
@@ -192,10 +192,10 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 `-ot` (tensor override) rules must come **before** `--cpu-moe` on the command line. The first matching override wins, so an `-ot` placed after `--cpu-moe` is silently ignored.
 
 ```sh
-# correct — -ot overrides the first 8 expert layers to GPU
+# correct â€” -ot overrides the first 8 expert layers to GPU
 llama-server -m model.gguf -ot "blk\.[0-7]\.ffn_(gate|up|down)_exps\.weight=CUDA0" --cpu-moe --bells -fa
 
-# wrong — -ot is ignored because --cpu-moe already matched
+# wrong â€” -ot is ignored because --cpu-moe already matched
 llama-server -m model.gguf --cpu-moe -ot "blk\.[0-7]\.ffn_(gate|up|down)_exps\.weight=CUDA0" --bells -fa
 ```
 
@@ -208,7 +208,7 @@ BELLS supports two multi-GPU modes depending on your setup.
 When attention layers are split across GPUs with `--device`, BELLS sizes each GPU's expert cache independently based on its own free VRAM. A 24 GB card and a 6 GB card in the same system each get the slot count that fits, instead of both being limited to the smaller card.
 
 ```sh
-# 2x NVIDIA GPUs — each auto-sized independently
+# 2x NVIDIA GPUs â€” each auto-sized independently
 llama-server -m model.gguf -ngl 99 --device CUDA0,CUDA1 --cpu-moe --bells -fa
 
 # 2x AMD GPUs
@@ -229,7 +229,7 @@ llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 --bells-l2-slots -
 llama-server -m model.gguf -ngl 99 --cpu-moe --bells-slots 80 --bells-l2-slots 200 -fa
 ```
 
-When an expert is evicted from L1 (primary GPU), it goes to L2 (secondary GPU) instead of being discarded. Next time it's needed, it copies from GPU 2 VRAM — a fast device-to-device transfer instead of a page fault from NVMe.
+When an expert is evicted from L1 (primary GPU), it goes to L2 (secondary GPU) instead of being discarded. Next time it's needed, it copies from GPU 2 VRAM â€” a fast device-to-device transfer instead of a page fault from NVMe.
 
 ## Speculative decoding (MTP)
 
@@ -263,59 +263,59 @@ BELLS_PREFILL_STAGE=1 llama-server -m model.gguf --auto --bells-reserve 2200 -ub
 ## How it works
 
 ```
-                ┌──────────────────────────────────────────┐
-                │              BELLS cache                 │
-                │                                          │
-  Router      ┌──────────┐  evict   ┌──────────┐          │
-  picks       │ L1 cache │ ──────▶  │ L2 cache │          │
-  expert E    │ GPU 1    │ ◀──────  │ GPU 2    │          │
-  ──────────▶ │(compute) │ promote  │(storage) │          │
-              └──────────┘          └──────────┘          │
-                   │ miss                │ miss            │
-                   ▼                     ▼                 │
-              ┌──────────┐         ┌──────────┐           │
-              │ Host RAM │         │  (skip)  │           │
-              │ or NVMe  │         │          │           │
-              └──────────┘         └──────────┘           │
-              (may page fault)                             │
-              └────────────────────────────────────────────┘
+                â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                â”‚              BELLS cache                 â”‚
+                â”‚                                          â”‚
+  Router      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”  evict   â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”          â”‚
+  picks       â”‚ L1 cache â”‚ â”€â”€â”€â”€â”€â”€â–¶  â”‚ L2 cache â”‚          â”‚
+  expert E    â”‚ GPU 1    â”‚ â—€â”€â”€â”€â”€â”€â”€  â”‚ GPU 2    â”‚          â”‚
+  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¶ â”‚(compute) â”‚ promote  â”‚(storage) â”‚          â”‚
+              â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜          â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜          â”‚
+                   â”‚ miss                â”‚ miss            â”‚
+                   â–¼                     â–¼                 â”‚
+              â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”           â”‚
+              â”‚ Host RAM â”‚         â”‚  (skip)  â”‚           â”‚
+              â”‚ or NVMe  â”‚         â”‚          â”‚           â”‚
+              â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜           â”‚
+              (may page fault)                             â”‚
+              â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 
 Multi-GPU active mode (--device GPU0,GPU1):
 
-  Router      ┌──────────┐          ┌──────────┐
-  picks       │ GPU 0    │          │ GPU 1    │
-  expert E    │ 80 slots │          │ 40 slots │
-  ──────────▶ │ layers   │          │ layers   │
-              │  0–15    │          │  16–31   │
-              └──────────┘          └──────────┘
-                   │ miss                │ miss
-                   ▼                     ▼
-              ┌──────────────────────────────────┐
-              │    Host RAM / NVMe (experts)     │
-              └──────────────────────────────────┘
+  Router      â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”          â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+  picks       â”‚ GPU 0    â”‚          â”‚ GPU 1    â”‚
+  expert E    â”‚ 80 slots â”‚          â”‚ 40 slots â”‚
+  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¶ â”‚ layers   â”‚          â”‚ layers   â”‚
+              â”‚  0â€“15    â”‚          â”‚  16â€“31   â”‚
+              â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜          â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                   â”‚ miss                â”‚ miss
+                   â–¼                     â–¼
+              â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+              â”‚    Host RAM / NVMe (experts)     â”‚
+              â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 ```
 
 ### The cache hierarchy
 
-1. **L1 (GPU VRAM)** — the working cache. Experts are loaded here for compute. Uses LRU eviction with per-layer clock counters. With multiple active GPUs, each device gets its own independent slot count.
+1. **L1 (GPU VRAM)** â€” the working cache. Experts are loaded here for compute. Uses LRU eviction with per-layer clock counters. With multiple active GPUs, each device gets its own independent slot count.
 
-2. **L2 (secondary GPU, optional)** — a victim cache for single-compute-GPU setups. When L1 evicts an expert, it goes to L2 instead of being discarded. L2 uses its own LRU policy. Automatically disabled when both GPUs are active.
+2. **L2 (secondary GPU, optional)** â€” a victim cache for single-compute-GPU setups. When L1 evicts an expert, it goes to L2 instead of being discarded. L2 uses its own LRU policy. Automatically disabled when both GPUs are active.
 
-3. **Host memory** — the cold tier. Expert weights served via mmap (or pinned allocation with `--cpu-moe-pinned`). When the model doesn't fit in RAM, the OS page cache handles NVMe paging transparently.
+3. **Host memory** â€” the cold tier. Expert weights served via mmap (or pinned allocation with `--cpu-moe-pinned`). When the model doesn't fit in RAM, the OS page cache handles NVMe paging transparently.
 
 ### Data flow for a single expert load
 
 ```
-Token arrives → Router selects experts → For each expert not in L1:
+Token arrives â†’ Router selects experts â†’ For each expert not in L1:
 
   1. EVICTION:  Pick least-recently-used slot in this layer's cache
-                If L2 exists: demote victim → staging buffer → write to L2 slot
+                If L2 exists: demote victim â†’ staging buffer â†’ write to L2 slot
 
   2. L2 CHECK:  Look up requested expert in L2 index
-                  HIT  → read from L2 → staging → write to L1 slot → done
-                  MISS → fall through to cold path
+                  HIT  â†’ read from L2 â†’ staging â†’ write to L1 slot â†’ done
+                  MISS â†’ fall through to cold path
 
-  3. COLD PATH: Read from host memory → write to L1 slot
+  3. COLD PATH: Read from host memory â†’ write to L1 slot
                 (may page fault from NVMe if model exceeds RAM)
 ```
 
@@ -324,13 +324,13 @@ Token arrives → Router selects experts → For each expert not in L1:
 - **Per-device slot sizing.** Each GPU gets the slot count its own free VRAM supports. A 24 GB and 6 GB card in the same system aren't bottlenecked by the smaller card.
 - **Auto-sizing with upward probing.** The auto-sizer computes an initial estimate from free VRAM, then probes upward with real allocations to find the actual maximum. It checks each probe against physical VRAM to avoid over-allocation into managed memory.
 - **Smart L2 detection.** L2 is automatically skipped when the candidate GPU already hosts BELLS cache layers. No manual flag juggling for multi-GPU setups.
-- **Per-layer indexing.** Each layer maintains its own slot map (`expert → slot`). This matches how MoE routing works and avoids cross-layer eviction interference.
+- **Per-layer indexing.** Each layer maintains its own slot map (`expert â†’ slot`). This matches how MoE routing works and avoids cross-layer eviction interference.
 - **Victim cache semantics.** L2 only receives data evicted from L1 (or promoted back). It never loads directly from host. This keeps the L2 population naturally tuned to the model's actual access pattern.
 - **Backward compatible.** Single-GPU systems behave identically to stock llama.cpp. Dense models are completely unaffected.
 
 ### Adaptive pins
 
-Set `BELLS_ADAPT=N` to let the cache track which experts are actually hot and swap cold residents for hot non-residents every N tokens. Without it, the cache is purely reactive — it only loads an expert when the router asks for it. With adaptive pins, usage counters decay over time and a background pass swaps the coldest cached experts for the hottest ones that aren't cached yet, keeping the working set aligned with the model's shifting attention.
+Set `BELLS_ADAPT=N` to let the cache track which experts are actually hot and swap cold residents for hot non-residents every N tokens. Without it, the cache is purely reactive â€” it only loads an expert when the router asks for it. With adaptive pins, usage counters decay over time and a background pass swaps the coldest cached experts for the hottest ones that aren't cached yet, keeping the working set aligned with the model's shifting attention.
 
 ### Global prefetch
 
@@ -360,7 +360,7 @@ The estimator models cache hit rates, transfer bandwidth (including page-cache-a
 
 Over 50 GPUs are in the database, including:
 - **NVIDIA Desktop:** RTX 20-series through 50-series
-- **NVIDIA Laptop:** RTX 3060–5080 Laptop variants (with adjusted bandwidth)
+- **NVIDIA Laptop:** RTX 3060â€“5080 Laptop variants (with adjusted bandwidth)
 - **NVIDIA Data Center:** A10, A100, L4, L40
 - **AMD Desktop:** RX 7600 through 9070 XT
 - **Intel:** Arc A770, Arc B580
@@ -374,7 +374,7 @@ Find the optimal BELLS configuration for your system automatically:
 ```sh
 cd tools/bells-manager
 
-# quick benchmark — tests key configurations
+# quick benchmark â€” tests key configurations
 python bells.py bench -m /path/to/model.gguf -p short
 
 # thorough benchmark
@@ -428,15 +428,15 @@ pip install huggingface_hub    # for model search
 |---|---|---|
 | Memory mode | mmap (virtual, backed by page cache) | Pinned in physical RAM |
 | Model fits in RAM | Slightly slower copies | Fastest copies (async DMA) |
-| Model exceeds RAM | Works — OS pages from NVMe transparently | Will exhaust RAM and swap, don't use |
+| Model exceeds RAM | Works â€” OS pages from NVMe transparently | Will exhaust RAM and swap, don't use |
 | Use when | Model > RAM, or you want to share RAM with other apps | Model fits comfortably in RAM and you want max throughput |
 
 ### Combining `-ot` with BELLS
 
-You can pin the hottest expert layers to the GPU with `-ot` and let BELLS cache the rest. Layers already in VRAM are skipped by the cache — no wasted slots, no conflicts. This gives you fast prefill from the pinned layers and fast decode from the cache on everything else.
+You can pin the hottest expert layers to the GPU with `-ot` and let BELLS cache the rest. Layers already in VRAM are skipped by the cache â€” no wasted slots, no conflicts. This gives you fast prefill from the pinned layers and fast decode from the cache on everything else.
 
 ```sh
-# pin layers 0–7 to GPU, BELLS caches experts for layers 8–47
+# pin layers 0â€“7 to GPU, BELLS caches experts for layers 8â€“47
 llama-server -m model.gguf -ngl 99 \
   -ot "blk\.[0-7]\.ffn_(gate|up|down)_exps\.weight=CUDA0" \
   --cpu-moe --bells -fa -c 4096
@@ -455,15 +455,15 @@ llama-server -m model.gguf --auto --cache-type-k q8_0 --cache-type-v q8_0 -c 163
 
 ### Common issues
 
-**"failed to allocate expert slots"** — Not enough free VRAM after loading attention layers and KV cache. Reduce context (`-c`), use KV quantisation, or close other GPU applications.
+**"failed to allocate expert slots"** â€” Not enough free VRAM after loading attention layers and KV cache. Reduce context (`-c`), use KV quantisation, or close other GPU applications.
 
-**Output looks corrupted or produces NaN** — On some systems, CUDA pinned (page-locked) memory allocation returns bad data due to IOMMU or DMA issues. Set `GGML_CUDA_NO_PINNED=1` to disable pinned host memory.
+**Output looks corrupted or produces NaN** â€” On some systems, CUDA pinned (page-locked) memory allocation returns bad data due to IOMMU or DMA issues. Set `GGML_CUDA_NO_PINNED=1` to disable pinned host memory.
 
-**Server starts but BELLS isn't active** — Make sure you're using a MoE model. BELLS is silently disabled for dense models. Check stderr for `init:` lines confirming BELLS loaded with a slot count > 0.
+**Server starts but BELLS isn't active** â€” Make sure you're using a MoE model. BELLS is silently disabled for dense models. Check stderr for `init:` lines confirming BELLS loaded with a slot count > 0.
 
-**Lower throughput than expected** — Make sure the system is idle (no games, encoders, or other GPU-heavy apps). Background processes sharing VRAM reduce the slots available. Use `nvidia-smi` or equivalent to check free VRAM before launching.
+**Lower throughput than expected** â€” Make sure the system is idle (no games, encoders, or other GPU-heavy apps). Background processes sharing VRAM reduce the slots available. Use `nvidia-smi` or equivalent to check free VRAM before launching.
 
-**`-ot` overrides being ignored** — They must come before `--cpu-moe` on the command line. See [Flag ordering](#flag-ordering).
+**`-ot` overrides being ignored** â€” They must come before `--cpu-moe` on the command line. See [Flag ordering](#flag-ordering).
 
 ## How BELLS compares to other approaches
 
@@ -487,6 +487,13 @@ BELLS is the only approach that maintains full output quality while running mode
 <b>LLM inference in C/C++</b>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
+[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
+[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
+[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+
+[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 </div>
 
@@ -502,10 +509,10 @@ llama-server -hf ggml-org/Qwen3.5-0.8B-GGUF
 
 ## Description
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware — locally and in the cloud.
+The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware â€” locally and in the cloud.
 
 - Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen — optimized via ARM NEON, Accelerate and Metal frameworks
+- Apple silicon is a first-class citizen â€” optimized via ARM NEON, Accelerate and Metal frameworks
 - AVX, AVX2, AVX512 and AMX support for x86 architectures
 - 1.5-bit through 8-bit integer quantization for faster inference and reduced memory use
 - Custom CUDA kernels for NVIDIA GPUs (AMD via HIP, Moore Threads via MUSA)
@@ -530,4 +537,4 @@ See the upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) for the full
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT â€” see [LICENSE](LICENSE).

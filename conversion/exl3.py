@@ -317,6 +317,7 @@ def pack_and_write_exl3(model: ModelBase) -> None:
     else:
         model.gguf_writer.add_string(gguf.Keys.Exl3.PACK, "mma")
     model.gguf_writer.add_string(gguf.Keys.Exl3.CODEBOOK, codebook)
+    model.gguf_writer.add_uint32(gguf.Keys.Exl3.TYPE_ID_BASE, 44)
     logger.info("GGUF exl3.codebook=%s", codebook)
 
     logger.info(

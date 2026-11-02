@@ -1,0 +1,12 @@
+0.00.048.372 I srv  llama_server: initializing ...
+0.00.048.402 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.048.912 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.065.027 I srv    load_model: loading model 'E:\bells-models\Qwen3.6-35B-A3B-abliterated-v4-Q4_K_M.gguf'
+0.08.214.524 W ggml_backend_cuda_host_buffer_type_alloc_buffer: could not pin 864.00 MiB, falling back to pageable host memory - host-to-device copies will block the caller
+init: working set 0.61 GiB (40 layers x 8 experts x 1.95 MiB), cache holds 4.0x it -> enough to try, but measure - a high ratio does not predict a speedup
+init: 32 slots/layer of 256 experts, 2.34 GiB VRAM, serves ubatch <= 4
+3.41.852.651 I cmn          init: llama threadpool init, n_threads = 8
+3.41.879.019 E CUDA error: no kernel image is available for execution on the device
+3.41.879.340 E   current device: 0, in function ggml_cuda_kernel_can_use_pdl at C:\Users\Daniel\bellsdemo-upstream\ggml\src\ggml-cuda\common.cuh:1686
+3.41.879.343 E   cudaFuncGetAttributes(&attr, kernel)
+C:\Users\Daniel\bellsdemo-upstream\ggml\src\ggml-cuda\ggml-cuda.cu:111: CUDA error

@@ -1,0 +1,26 @@
+0.00.087.053 I srv  llama_server: initializing ...
+0.00.087.294 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.090.987 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.097.007 I srv    load_model: loading model 'E:\bells-models\Qwen3.6-35B-A3B-abliterated-v4-Q4_K_M.gguf'
+0.03.991.040 W ggml_backend_cuda_host_buffer_type_alloc_buffer: could not pin 864.00 MiB, falling back to pageable host memory - host-to-device copies will block the caller
+init: working set 0.61 GiB (40 layers x 8 experts x 1.95 MiB), cache holds 4.0x it -> enough to try, but measure - a high ratio does not predict a speedup
+init: 32 slots/layer of 256 experts, 2.34 GiB VRAM, serves ubatch <= 4
+3.28.147.813 I cmn          init: llama threadpool init, n_threads = 8
+3.28.770.991 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 65536, kv_unified = 'false'
+3.28.788.648 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+3.28.789.129 I srv  server_run_i: model loaded
+3.28.789.364 I srv  server_on_li: listening on http://127.0.0.1:8030
+3.30.023.759 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+3.30.024.162 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+bells_timing: per layer-call: readback 24.7 us, copy 629.1 us, upload 56.9 us, hit 57.4% (2000 calls)
+bells_timing: per layer-call: readback 21.3 us, copy 405.7 us, upload 49.3 us, hit 65.7% (4000 calls)
+3.34.406.214 I slot print_timing: id  0 | task 0 | n_gen =    100, tg =  25.64 t/s, tg_3s =  25.90 t/s
+bells_timing: per layer-call: readback 21.6 us, copy 343.5 us, upload 49.2 us, hit 67.2% (6000 calls)
+3.37.411.256 I slot print_timing: id  0 | task 0 | n_gen =    183, tg =  26.51 t/s, tg_3s =  27.62 t/s
+bells_timing: per layer-call: readback 20.8 us, copy 306.0 us, upload 48.3 us, hit 68.4% (8000 calls)
+3.37.927.996 I slot print_timing: id  0 | task 0 | prompt eval time =     520.36 ms /     8 tokens (   65.05 ms per token,    15.37 tokens per second)
+3.37.928.003 I slot print_timing: id  0 | task 0 |        eval time =    7383.20 ms /   200 tokens (   37.10 ms per token,    26.95 tokens per second)
+3.37.928.003 I slot print_timing: id  0 | task 0 |       total time =    7903.56 ms /   208 tokens
+3.37.928.004 I slot print_timing: id  0 | task 0 |    graphs reused =        199
+3.37.928.005 I slot print_timing: id  0 | task 0 |   graph reallocs =          2    /     0        (same size) / (changed size)
+3.37.928.766 I slot      release: id  0 | task 0 | stop processing: n_tokens = 207, truncated = 0

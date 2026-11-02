@@ -5,6 +5,7 @@ Usage:
     bells                      Launch the TUI
     bells --gui                Launch in browser (requires textual-web)
     bells bench [OPTIONS]      Run benchmark from command line
+    bells tune [OPTIONS]       Time-budgeted hardware autotune
     bells system               Print system info
     bells models               List local models
     bells install              Run the installer
@@ -142,6 +143,7 @@ def main():
     sub.add_parser("install", help="Run installer")
 
     sub.add_parser("estimate", help="Estimate BELLS performance (has own args)")
+    sub.add_parser("tune", help="Benchmark hardware for ~10 minutes and print best flags")
 
     bench_p = sub.add_parser("bench", help="Run benchmark")
     bench_p.add_argument("-m", "--model", help="Path to .gguf model")
@@ -150,11 +152,14 @@ def main():
                          default="short", help="Benchmark profile")
     bench_p.add_argument("-o", "--output", default=None, help="Output directory")
 
-    # Estimate subcommand has its own argparse, so intercept early
+    # Estimate/tune subcommands have their own argparse, so intercept early
     if len(sys.argv) > 1 and sys.argv[1] == "estimate":
         from estimator import main as est_main
         est_main(sys.argv[2:])
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "tune":
+        from tune import main as tune_main
+        raise SystemExit(tune_main(sys.argv[2:]))
 
     args = parser.parse_args()
 

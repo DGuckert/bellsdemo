@@ -380,6 +380,9 @@ python bells.py bench -m /path/to/model.gguf -p short
 # thorough benchmark
 python bells.py bench -m /path/to/model.gguf -p long -c 8192
 
+# 10-minute hardware autotune; prints the best ready-to-run flags
+python bells.py tune -m /path/to/model.gguf --minutes 10 --server /path/to/llama-server
+
 # just list detected models
 python bells.py models
 

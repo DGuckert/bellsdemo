@@ -6,16 +6,18 @@ on the CUDA backend. Normal Q/IQ GGUF models are unchanged.
 ## Hardware
 
 The upstream EXL3 CUDA kernels target `sm_86` and `sm_89` (RTX 30-series and
-RTX 40-series). Build with:
+RTX 40-series). A mixed build keeps BELLS usable on older cards:
 
 ```sh
-cmake -S . -B build-cuda-exl3 -G Ninja \
-  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89"
-cmake --build build-cuda-exl3 --target llama-server
+cmake -S . -B build-cuda -G Ninja \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86"
+cmake --build build-cuda --target llama-server
 ```
 
-`sm_75` (RTX 20-series) and `sm_120` (RTX 50-series) are not covered by the
-current EXL3 cubins. Those GPUs can still run ordinary Q/IQ GGUFs.
+`ggml/src/ggml-cuda/exl3.cu` is compiled for `sm_86` only; the rest of the
+backend keeps `sm_75`. A normal Q/IQ model therefore runs on an RTX 20-series,
+while an EXL3 model returns a CUDA error there. `sm_120` (RTX 50-series) is not
+covered by the current EXL3 cubins.
 
 ## Convert
 
@@ -26,9 +28,13 @@ Start from a packed EXL3 safetensors directory produced by ExLlamaV3's
 PYTHONPATH=./gguf-py python3 convert_hf_to_gguf.py <exl3-dir> --outtype auto
 ```
 
-The converter writes `exl3.pack`, `exl3.codebook`, the packed weight, and the
-required `suh`/`svh` F32 companions. `EXL3_PACK=xe2-16` is SYCL-only and is
-rejected by the CUDA runtime.
+The converter writes `exl3.pack`, `exl3.codebook`, `exl3.type_id_base`, the
+packed weight, and the required `suh`/`svh` F32 companions. `EXL3_PACK=xe2-16`
+is SYCL-only and is rejected by the CUDA runtime.
+
+Upstream added `F8_E4M3` at type ID 43, so current EXL3 IDs are 44-51. Older
+EXL3 GGUFs used 43-50 and have no `exl3.type_id_base`; the loader shifts those
+IDs by one at load time, so existing files keep working.
 
 ## BELLS
 
@@ -53,10 +59,10 @@ ctest --test-dir build-cpu -C Release -R "test-exl3-types|test-bells-cache-regre
 
 ```sh
 # CUDA/EXL3 build
-cmake -S . -B build-cuda-exl3 -G "Visual Studio 17 2022" -A x64 \
-  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_TESTS=ON
-cmake --build build-cuda-exl3 --config Release --target llama-server test-exl3-types
-ctest --test-dir build-cuda-exl3 -C Release -R test-exl3-types
+cmake -S . -B build-cuda -G "Visual Studio 17 2022" -A x64 \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;86" -DLLAMA_BUILD_TESTS=ON
+cmake --build build-cuda --config Release --target llama-server test-exl3-types
+ctest --test-dir build-cuda -C Release -R test-exl3-types
 # 100% tests passed, 0 tests failed out of 1
 ```
 

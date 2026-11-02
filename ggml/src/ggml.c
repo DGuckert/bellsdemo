@@ -690,6 +690,24 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
+#define GGML_EXL3_TRAITS(bits) \
+    [GGML_TYPE_EXL3_##bits] = { \
+        .type_name                = "exl3_" #bits, \
+        .blck_size                = QK_EXL3, \
+        .type_size                = sizeof(block_exl3_##bits), \
+        .is_quantized             = true, \
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3, \
+        .from_float_ref           = NULL, \
+    }
+    GGML_EXL3_TRAITS(1),
+    GGML_EXL3_TRAITS(2),
+    GGML_EXL3_TRAITS(3),
+    GGML_EXL3_TRAITS(4),
+    GGML_EXL3_TRAITS(5),
+    GGML_EXL3_TRAITS(6),
+    GGML_EXL3_TRAITS(7),
+    GGML_EXL3_TRAITS(8),
+#undef GGML_EXL3_TRAITS
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1353,6 +1371,53 @@ const char * ggml_type_name(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     return type_traits[type].type_name;
+}
+
+bool ggml_is_exl3(enum ggml_type type) {
+    return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8;
+}
+
+int ggml_exl3_n_bits(enum ggml_type type) {
+    GGML_ASSERT(ggml_is_exl3(type));
+    return (int) type - (int) GGML_TYPE_EXL3_1 + 1;
+}
+
+static int g_exl3_pack = 0;
+
+void ggml_exl3_set_pack(int pack) {
+    g_exl3_pack = pack ? 1 : 0;
+}
+
+int ggml_exl3_get_pack(void) {
+    const char * e = getenv("GGML_EXL3_PACK");
+    if (e && e[0]) {
+        if (strcmp(e, "xe2-16") == 0 || strcmp(e, "xe2") == 0 || strcmp(e, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(e, "mma") == 0 || strcmp(e, "0") == 0) {
+            return 0;
+        }
+    }
+    return g_exl3_pack;
+}
+
+static int g_exl3_codebook = 0;
+
+void ggml_exl3_set_codebook(int codebook) {
+    g_exl3_codebook = codebook ? 1 : 0;
+}
+
+int ggml_exl3_get_codebook(void) {
+    const char * e = getenv("GGML_EXL3_CODEBOOK");
+    if (e && e[0]) {
+        if (strcmp(e, "mcg") == 0 || strcmp(e, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(e, "mul1") == 0 || strcmp(e, "0") == 0) {
+            return 0;
+        }
+    }
+    return g_exl3_codebook;
 }
 
 bool ggml_is_quantized(enum ggml_type type) {

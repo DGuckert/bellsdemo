@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -1917,6 +1918,11 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    if (ggml_is_exl3(src0->type)) {
+        ggml_cuda_mul_mat_exl3(ctx, src0, src1, dst);
+        return;
+    }
+
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
@@ -2004,6 +2010,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    if (ggml_is_exl3(src0->type)) {
+        ggml_cuda_mul_mat_exl3_id(ctx, dst);
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -5520,6 +5531,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_EXL3_1:
+                    case GGML_TYPE_EXL3_2:
+                    case GGML_TYPE_EXL3_3:
+                    case GGML_TYPE_EXL3_4:
+                    case GGML_TYPE_EXL3_5:
+                    case GGML_TYPE_EXL3_6:
+                    case GGML_TYPE_EXL3_7:
+                    case GGML_TYPE_EXL3_8:
                         return true;
                     default:
                         return false;

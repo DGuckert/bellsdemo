@@ -289,6 +289,10 @@ class Keys:
         L_CYCLES         = "{arch}.hrm.l_cycles"
         PREFIX_LM        = "{arch}.hrm.prefix_lm"
 
+    class Exl3:
+        PACK     = "exl3.pack"
+        CODEBOOK = "exl3.codebook"
+
     class SSM:
         CONV_KERNEL    = "{arch}.ssm.conv_kernel"
         INNER_SIZE     = "{arch}.ssm.inner_size"
@@ -5904,6 +5908,14 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    EXL3_1  = 43
+    EXL3_2  = 44
+    EXL3_3  = 45
+    EXL3_4  = 46
+    EXL3_5  = 47
+    EXL3_6  = 48
+    EXL3_7  = 49
+    EXL3_8  = 50
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6108,6 +6120,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.EXL3_1:  (256, 32),
+    GGMLQuantizationType.EXL3_2:  (256, 64),
+    GGMLQuantizationType.EXL3_3:  (256, 96),
+    GGMLQuantizationType.EXL3_4:  (256, 128),
+    GGMLQuantizationType.EXL3_5:  (256, 160),
+    GGMLQuantizationType.EXL3_6:  (256, 192),
+    GGMLQuantizationType.EXL3_7:  (256, 224),
+    GGMLQuantizationType.EXL3_8:  (256, 256),
 }
 
 

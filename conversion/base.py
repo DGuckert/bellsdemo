@@ -576,6 +576,9 @@ class ModelBase:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith((".input_scale", ".k_scale", ".v_scale")):
                         tensors_to_remove.append(name)
+            elif quant_method == "exl3":
+                # Packed in conversion/exl3.py before this loop; leftover keys are dropped there.
+                pass
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 
@@ -744,7 +747,12 @@ class ModelBase:
         return [(new_name, data_torch)]
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        del new_name, bid  # unused
+        del bid  # unused
+        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
+        if quant_method == "exl3" and n_dims >= 2 and (
+            new_name == "token_embd.weight" or name.endswith("embed_tokens.weight")
+        ):
+            return gguf.GGMLQuantizationType.Q8_0
         # Force FP8-original tensors to Q8_0 when requested; Q8_0 is faster than F16/BF16.
         if self._fp8_as_q8 and name in self._fp8_dequantized and n_dims >= 2:
             return gguf.GGMLQuantizationType.Q8_0

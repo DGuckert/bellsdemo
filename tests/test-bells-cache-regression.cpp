@@ -1,4 +1,4 @@
-// Regression tests for BELLS critical bugs
+﻿// Regression tests for BELLS critical bugs
 // 1. Failed residency checks must not corrupt cache state (transactional ensure)
 // 2. Re-quantised cache + L2 must not write out of bounds and must reject unsupported combos
 // 7. Adaptive swaps must not corrupt while GPU reading (verified via API availability)
@@ -63,7 +63,7 @@ static bool test_ensure_rollback() {
     uint64_t before_hit = cache.n_hit();
     uint64_t before_miss = cache.n_miss();
 
-    // Try to ensure 6 distinct experts into 4 slots — must fail
+    // Try to ensure 6 distinct experts into 4 slots â€” must fail
     const int32_t want[6] = {4,5,6,7,1,2}; // 6 distinct, but 2 overlap with resident
     // Actually need 6 distinct that are all not resident + overlap: let's do 4,5,6,7,0,1 -> 6 distinct, but 2 overlap still 6 distinct total? n_slot=4 cannot hold 6 distinct
     // Use 4 new experts plus 2 existing: distinct = 6 > 4 => should fail
@@ -196,7 +196,7 @@ static bool test_l2_requant_reject() {
     // Create fake source tensors (host resident)
     ggml_init_params ip = { ggml_tensor_overhead()*8, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    const int n_embd = 16, n_ff = 8, n_expert = 4;
+    const int n_embd = 32, n_ff = 8, n_expert = 4;
     ggml_tensor * src_gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_expert);
     ggml_tensor * src_up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_expert);
     ggml_tensor * src_down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_expert);
@@ -229,7 +229,7 @@ static bool test_l2_requant_reject() {
         return false;
     }
 
-    // Now try to init L2 — should be rejected with requant active
+    // Now try to init L2 â€” should be rejected with requant active
     bool l2_ok = tensors.init_l2(cpu_buft, 2, cpu_be, n_expert);
     if (l2_ok) {
         printf("FAIL: L2 init should have been rejected when requant is active\n");
@@ -248,7 +248,7 @@ static bool test_l2_requant_reject() {
     return true;
 }
 
-// Test 2b: bounds check on copy without L2 — ensure no OOB when types differ
+// Test 2b: bounds check on copy without L2 â€” ensure no OOB when types differ
 static bool test_copy_bounds() {
     printf("test_copy_bounds: ");
 
@@ -294,6 +294,7 @@ static bool test_copy_bounds() {
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     int failures = 0;
     if (!test_ensure_rollback()) failures++;
     if (!test_ensure_pinned_rollback()) failures++;

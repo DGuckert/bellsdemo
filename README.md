@@ -6,6 +6,15 @@ BELLS (**B**uffered **E**xpert **L**oading with **L**ayered **S**lots) is a [lla
 
 Every expert the router picks still gets computed on the GPU — nothing is skipped, pruned, or approximated. With the default cache path, output is bit-identical to full-GPU inference. Optional modes like `--bells-cache-type` (re-quantisation) and `--bells-split` (CPU/GPU split) change precision by design.
 
+## EXL3
+
+EXL3-packed GGUF tensors are accepted on the CUDA backend (`exl3.pack=mma`).
+The upstream kernels target `sm_86`/`sm_89`; RTX 20-series (`sm_75`) is not
+covered. Ordinary Q/IQ GGUFs are unchanged, and BELLS remains type-agnostic:
+no per-quant weights, tuned constants, or model-specific slot profiles are
+introduced. See [docs/EXL3.md](docs/EXL3.md) for conversion, build and
+verification details.
+
 ## Install
 
 ### One-command install

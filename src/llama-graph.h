@@ -20,6 +20,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 struct llama_prec_policy;
 
 struct llama_memory_context_i;
@@ -170,6 +171,20 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+};
+
+// temperature tuning, used by llama4
+class llm_graph_input_exl3_h128 : public llm_graph_input_i {
+public:
+    llm_graph_input_exl3_h128(const float * data) : data(data) {}
+    virtual ~llm_graph_input_exl3_h128() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * h128 = nullptr;
+    const float * data = nullptr;
 };
 
 // temperature tuning, used by llama4
@@ -789,6 +804,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    const llama_model * model = nullptr;
     const llama_prec_policy * prec_policy = nullptr;
     bells_runtime * bells = nullptr;
 
@@ -1036,8 +1052,11 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    const llama_model * model;
     const llama_prec_policy * prec_policy;
     bells_runtime * bells;
+
+    mutable ggml_tensor * inp_exl3_h128 = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1060,6 +1079,8 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    ggml_tensor * get_exl3_h128() const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(

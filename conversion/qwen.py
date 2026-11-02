@@ -633,6 +633,27 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
         yield from super().modify_tensors(data_torch, name, bid)
 
+    @classmethod
+    def filter_tensors(cls, item):
+        if "visual." in item[0]:
+            return None
+        return super().filter_tensors(item)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
+        if quant_method == "exl3" and n_dims >= 2 and (
+            new_name == "token_embd.weight" or name.endswith("embed_tokens.weight")
+        ):
+            return gguf.GGMLQuantizationType.Q8_0
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def prepare_tensors(self):
+        quant_method = (self.hparams.get("quantization_config") or {}).get("quant_method")
+        if quant_method == "exl3":
+            from .exl3 import pack_and_write_exl3
+            pack_and_write_exl3(self)
+        super().prepare_tensors()
+
 
 class _Qwen35MRopeMixin:
     # Qwen3.5 always applies interleaved MRoPE (see Qwen3_5RotaryEmbedding in transformers);

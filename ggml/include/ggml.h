@@ -430,7 +430,15 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_EXL3_1  = 43, // EXL3 1-bit 16x16 trellis tile
+        GGML_TYPE_EXL3_2  = 44,
+        GGML_TYPE_EXL3_3  = 45,
+        GGML_TYPE_EXL3_4  = 46,
+        GGML_TYPE_EXL3_5  = 47,
+        GGML_TYPE_EXL3_6  = 48,
+        GGML_TYPE_EXL3_7  = 49,
+        GGML_TYPE_EXL3_8  = 50,
+        GGML_TYPE_COUNT   = 51,
     };
 
     // [TAG_GGML_PREC]
@@ -775,6 +783,14 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+    GGML_API bool    ggml_is_exl3(enum ggml_type type);
+    GGML_API int     ggml_exl3_n_bits(enum ggml_type type);
+    // 0 = MMA v3 walk, 1 = xe2-16 K-column walk. GGUF key exl3.pack or GGML_EXL3_PACK.
+    GGML_API void    ggml_exl3_set_pack(int pack);
+    GGML_API int     ggml_exl3_get_pack(void);
+    // 0 = mul1, 1 = mcg. GGUF key exl3.codebook or GGML_EXL3_CODEBOOK.
+    GGML_API void    ggml_exl3_set_codebook(int codebook);
+    GGML_API int     ggml_exl3_get_codebook(void);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);

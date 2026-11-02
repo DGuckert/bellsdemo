@@ -1499,6 +1499,52 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+static std::string llama_exl3_companion_name(const char * weight_name, const char * suffix) {
+    std::string name(weight_name);
+    const auto dot = name.rfind('.');
+    if (dot == std::string::npos) {
+        return name + "." + suffix;
+    }
+    return name.substr(0, dot + 1) + suffix;
+}
+
+static ggml_tensor * llama_create_exl3_companion(
+        llama_model_loader & ml,
+        ggml_context * ctx,
+        const std::string & name,
+        std::initializer_list<int64_t> ne,
+        const char * weight_name) {
+    if (ml.files.empty()) {
+        ggml_tensor * t;
+        if (ne.size() == 1) {
+            t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, *ne.begin());
+        } else if (ne.size() == 2) {
+            auto it = ne.begin();
+            const int64_t ne0 = *it++;
+            t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, *it);
+        } else {
+            throw std::runtime_error(format("EXL3 companion '%s' has invalid rank", name.c_str()));
+        }
+        ggml_set_name(t, name.c_str());
+        return t;
+    }
+    if (!ml.get_weight(name.c_str())) {
+        throw std::runtime_error(format(
+                    "EXL3 weight '%s' is missing required companion '%s'",
+                    weight_name, name.c_str()));
+    }
+    const ggml_tensor * meta = ml.check_tensor_dims(name, std::vector<int64_t>(ne), true, false);
+    if (meta->type != GGML_TYPE_F32) {
+        throw std::runtime_error(format(
+                    "EXL3 companion '%s' must be F32, got %s",
+                    name.c_str(), ggml_type_name(meta->type)));
+    }
+    ggml_tensor * t = ggml_dup_tensor(ctx, meta);
+    ggml_set_name(t, name.c_str());
+    ml.n_created++;
+    return t;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1783,6 +1829,60 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // input scale
             if (!output_in_s) {
                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
+            }
+        }
+    }
+
+    // EXL3 suh/svh companions: required for every created EXL3 weight
+    {
+        std::vector<std::pair<ggml_context *, ggml_tensor *>> exl3_ws;
+        for (auto & [_, ctx_ptr] : ml.ctx_map) {
+            ggml_context * ctx = ctx_ptr.get();
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (ggml_is_exl3(t->type)) {
+                    exl3_ws.emplace_back(ctx, t);
+                }
+            }
+        }
+        for (auto [ctx, w] : exl3_ws) {
+            const char * wname = ggml_get_name(w);
+            const std::string suh_name = llama_exl3_companion_name(wname, "suh");
+            const std::string svh_name = llama_exl3_companion_name(wname, "svh");
+            ggml_tensor * suh;
+            ggml_tensor * svh;
+            if (w->ne[2] > 1) {
+                suh = llama_create_exl3_companion(ml, ctx, suh_name, { w->ne[0], w->ne[2] }, wname);
+                svh = llama_create_exl3_companion(ml, ctx, svh_name, { w->ne[1], w->ne[2] }, wname);
+            } else {
+                suh = llama_create_exl3_companion(ml, ctx, suh_name, { w->ne[0] }, wname);
+                svh = llama_create_exl3_companion(ml, ctx, svh_name, { w->ne[1] }, wname);
+            }
+            exl3_scales.emplace(w, std::make_pair(suh, svh));
+        }
+        if (!exl3_scales.empty()) {
+            LLAMA_LOG_DEBUG("%s: loaded suh/svh companions for %zu EXL3 weights\n", __func__, exl3_scales.size());
+            const int kid_pack = gguf_find_key(ml.metadata, "exl3.pack");
+            if (kid_pack >= 0) {
+                const char * pack = gguf_get_val_str(ml.metadata, kid_pack);
+                if (pack && strcmp(pack, "xe2-16") == 0) {
+                    ggml_exl3_set_pack(1);
+                    LLAMA_LOG_INFO("%s: EXL3 pack xe2-16\n", __func__);
+                }
+            }
+            const int kid_cb = gguf_find_key(ml.metadata, "exl3.codebook");
+            if (kid_cb >= 0) {
+                const char * cb = gguf_get_val_str(ml.metadata, kid_cb);
+                if (cb && strcmp(cb, "mcg") == 0) {
+                    ggml_exl3_set_codebook(1);
+                    LLAMA_LOG_INFO("%s: EXL3 codebook mcg\n", __func__);
+                } else if (cb && cb[0]) {
+                    ggml_exl3_set_codebook(0);
+                    if (strcmp(cb, "mul1") != 0) {
+                        LLAMA_LOG_WARN("%s: unknown exl3.codebook '%s', using mul1\n", __func__, cb);
+                    } else {
+                        LLAMA_LOG_INFO("%s: EXL3 codebook mul1\n", __func__);
+                    }
+                }
             }
         }
     }
@@ -2329,6 +2429,12 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
         return nullptr;
     }
 
+    return it->second;
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llama_model::get_exl3_scales(const ggml_tensor * w) const {
+    auto it = exl3_scales.find(w);
+    GGML_ASSERT(it != exl3_scales.end() && "missing EXL3 suh/svh companions");
     return it->second;
 }
 
@@ -2981,6 +3087,10 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+bool llama_model_has_exl3(const llama_model * model) {
+    return model && !model->exl3_scales.empty();
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {

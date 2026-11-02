@@ -1494,6 +1494,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    model            (params.model),
     prec_policy      (params.prec_policy),
     bells            (params.bells),
     samplers         (params.samplers),
@@ -1518,11 +1519,100 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+static void llama_gen_hadamard(ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+
+    const int n = tensor->ne[0];
+
+    GGML_ASSERT((n & (n - 1)) == 0);
+    GGML_ASSERT(tensor->ne[1] == n);
+    GGML_ASSERT(tensor->ne[2] == 1);
+    GGML_ASSERT(tensor->ne[3] == 1);
+
+    float * data = (float *) tensor->data;
+    data[0*n + 0] = 1.0f / sqrtf((float) n);
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                const float val = data[i*n + j];
+
+                data[(i + s)*n + (j    )] =  val;
+                data[(i    )*n + (j + s)] =  val;
+                data[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
+}
+
+static const std::vector<float> & llama_exl3_h128_data() {
+    static const std::vector<float> data = []() {
+        std::vector<float> v(128 * 128);
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx);
+        ggml_tensor * tmp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+        tmp->data = v.data();
+        llama_gen_hadamard(tmp);
+        ggml_free(ctx);
+        return v;
+    }();
+    return data;
+}
+
+void llm_graph_input_exl3_h128::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    GGML_ASSERT(h128);
+    GGML_ASSERT(data);
+    ggml_backend_tensor_set(h128, data, 0, ggml_nbytes(h128));
+}
+
+bool llm_graph_input_exl3_h128::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return true;
+}
+
+ggml_tensor * llm_graph_context::get_exl3_h128() const {
+    if (!inp_exl3_h128) {
+        auto inp = std::make_unique<llm_graph_input_exl3_h128>(llama_exl3_h128_data().data());
+        inp->h128 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 128, 128);
+        ggml_set_input(inp->h128);
+        ggml_set_name(inp->h128, "exl3_h128");
+        inp_exl3_h128 = inp->h128;
+        res->add_input(std::move(inp));
+    }
+    return inp_exl3_h128;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res;
+
+    if (ggml_is_exl3(w->type)) {
+        GGML_ASSERT(model);
+        GGML_ASSERT(w->ne[0] % 128 == 0);
+        GGML_ASSERT(w->ne[1] % 128 == 0);
+
+        const auto scales = model->get_exl3_scales(w);
+        ggml_tensor * suh = scales.first;
+        ggml_tensor * svh = scales.second;
+        GGML_ASSERT(suh && svh);
+
+        ggml_tensor * h128 = get_exl3_h128();
+        ggml_tensor * x = ggml_mul(ctx0, cur, suh);
+        x = llama_mul_mat_hadamard(ctx0, x, h128);
+        res = ggml_mul_mat(ctx0, w, x);
+        res = llama_mul_mat_hadamard(ctx0, res, h128);
+        res = ggml_mul(ctx0, res, svh);
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1563,7 +1653,27 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * ids_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res;
+
+    if (ggml_is_exl3(w->type)) {
+        GGML_ASSERT(model);
+        GGML_ASSERT(w->ne[0] % 128 == 0);
+        GGML_ASSERT(w->ne[1] % 128 == 0);
+        GGML_ASSERT(w->ne[2] > 1);
+
+        const auto scales = model->get_exl3_scales(w);
+        ggml_tensor * suh = scales.first;
+        ggml_tensor * svh = scales.second;
+        GGML_ASSERT(suh && svh);
+        GGML_ASSERT(suh->ne[0] == w->ne[0] && suh->ne[1] == w->ne[2]);
+        GGML_ASSERT(svh->ne[0] == w->ne[1] && svh->ne[1] == w->ne[2]);
+
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+        res->src[3] = suh;
+        res->src[4] = svh;
+    } else {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);

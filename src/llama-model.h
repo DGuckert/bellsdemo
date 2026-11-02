@@ -731,6 +731,9 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // EXL3 weight -> (suh [K], svh [N])
+    std::unordered_map<const ggml_tensor *, std::pair<ggml_tensor *, ggml_tensor *>> exl3_scales;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 
@@ -782,6 +785,9 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    // suh, svh for an EXL3 weight; asserts the companions were loaded
+    std::pair<ggml_tensor *, ggml_tensor *> get_exl3_scales(const ggml_tensor * w) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

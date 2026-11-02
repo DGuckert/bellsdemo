@@ -143,6 +143,14 @@ class Qwen3VLVisionModel(MmprojModel):
 
         yield from MmprojModel.modify_tensors(self, data_torch, name, bid)
 
+    def prepare_tensors(self):
+        qc = (getattr(self, "global_config", None) or self.hparams).get("quantization_config") or {}
+        if qc.get("quant_method") == "exl3":
+            from .exl3 import dequant_exl3_to_dense
+            n = dequant_exl3_to_dense(self)
+            logger.info("Dequantized %d EXL3 vision linears to F16", n)
+        super().prepare_tensors()
+
 
 @ModelBase.register("Qwen3OmniMoeForConditionalGeneration")
 @ModelBase.example("Qwen/Qwen3-Omni-30B-A3B-Instruct")

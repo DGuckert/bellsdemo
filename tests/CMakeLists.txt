@@ -350,6 +350,15 @@ endif()
 # BELLS regression tests for critical bug fixes
 llama_build_and_test(test-bells-cache-regression.cpp)
 target_link_libraries(test-bells-cache-regression PRIVATE llama)
+target_include_directories(test-bells-cache-regression PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (BUILD_SHARED_LIBS)
+    # bells_cache/bells_tensors are internal to the shared llama library; compile a local copy
+    # for the white-box test so its symbols are visible.
+    target_sources(test-bells-cache-regression PRIVATE ${PROJECT_SOURCE_DIR}/src/llama-bells.cpp)
+endif()
+
+# EXL3 type/block registration
+llama_build_and_test(test-exl3-types.cpp)
 
 # Python-level regression for safe extraction and bin preservation
 find_package(Python3 COMPONENTS Interpreter QUIET)

@@ -5626,7 +5626,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
-            // nothing to validate
+        case GGML_TYPE_EXL3_1:
+        case GGML_TYPE_EXL3_2:
+        case GGML_TYPE_EXL3_3:
+        case GGML_TYPE_EXL3_4:
+        case GGML_TYPE_EXL3_5:
+        case GGML_TYPE_EXL3_6:
+        case GGML_TYPE_EXL3_7:
+        case GGML_TYPE_EXL3_8:
+            // packed EXL3 codes are not IEEE floats
             break;
         default:
             {
@@ -5636,4 +5644,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     return true;
+}
+
+void dequantize_row_exl3(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    UNUSED(x); UNUSED(y); UNUSED(k);
+    GGML_ABORT("EXL3 CPU dequant is not implemented; run with the CUDA backend");
 }

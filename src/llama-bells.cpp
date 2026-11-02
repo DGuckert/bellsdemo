@@ -702,6 +702,10 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
                 if (!t) {
                     continue;
                 }
+                if (ggml_backend_buffer_is_host(t->buffer)) {
+                    std::memset(t->data, 0, ggml_nbytes(t));
+                    continue;
+                }
                 const size_t stride = ggml_nbytes(t)/t->ne[2];
                 for (int64_t s = 0; s < t->ne[2]; ++s) {
                     ggml_backend_tensor_set(t, zeros.data(), (size_t) s*stride, stride);
@@ -811,7 +815,12 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
                 }
 
                 rq.experts[expert].resize(rq.stride);
-                src_traits->to_float(base, f32_buf.data(), n_elements);
+                if (src->type == GGML_TYPE_F32) {
+                    std::memcpy(f32_buf.data(), base, (size_t) n_elements * sizeof(float));
+                } else {
+                    GGML_ASSERT(src_traits->to_float);
+                    src_traits->to_float(base, f32_buf.data(), n_elements);
+                }
                 dst_traits->from_float_ref(f32_buf.data(), rq.experts[expert].data(), n_elements);
             }
         };

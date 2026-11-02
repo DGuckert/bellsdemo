@@ -191,6 +191,24 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// EXL3 16x16 tiles. qs is the native ExLlamaV3 trellis for one tile.
+// Per-channel suh/svh scales live in companion F32 tensors, not in the block.
+#define QK_EXL3 256
+#define GGML_EXL3_BLOCK(bits, nbytes) \
+typedef struct { \
+    uint16_t qs[(bits) * 16]; \
+} block_exl3_##bits; \
+static_assert(sizeof(block_exl3_##bits) == (nbytes), "wrong exl3_" #bits " block size/padding")
+
+GGML_EXL3_BLOCK(1,  32);
+GGML_EXL3_BLOCK(2,  64);
+GGML_EXL3_BLOCK(3,  96);
+GGML_EXL3_BLOCK(4, 128);
+GGML_EXL3_BLOCK(5, 160);
+GGML_EXL3_BLOCK(6, 192);
+GGML_EXL3_BLOCK(7, 224);
+GGML_EXL3_BLOCK(8, 256);
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

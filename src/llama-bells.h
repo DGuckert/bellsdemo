@@ -212,6 +212,15 @@ public:
     ggml_tensor * down(uint32_t il)    const { return get(il).down;    }
     ggml_tensor * gate_up(uint32_t il) const { return get(il).gate_up; }
     ggml_tensor * slots(uint32_t il)   const { return get(il).slots;   }
+    ggml_tensor * state(uint32_t il)   const { return get(il).state;   }
+
+    // BELLS_GPU_RESOLVE: one ggml_moe_cache state per layer, so the device plans and fills the cache
+    void set_gpu_state(bool on) { want_state_ = on; }
+    bool gpu_state_ok(std::string & why) const;
+    void state_upload(uint32_t il, const std::vector<int32_t> & table);
+    void state_counts(int64_t out[6]) const;
+    // the cache tensors of layer il and the host data they copy from, in ggml_moe_cache order
+    int  cache_srcs(uint32_t il, ggml_tensor ** caches, const void ** hosts) const;
 
     bool has(uint32_t il) const { return il < index_.size() && index_[il] >= 0; }
 
@@ -224,9 +233,11 @@ public:
     bool pstage_ready() const { return pstage_buf_ != nullptr; }
     // experts/n: the ubatch's routing for this layer; only those experts are copied. Null copies every expert.
     // next_table: the cache's expert -> slot table of the next expert layer. Its resident experts are taken
-    // from the cache, device to device, and only the others cross PCIe.
+    // from the cache, device to device, and only the others cross PCIe. cur_table: the same for il, used when
+    // a small ubatch copies only its routed experts.
     void stage_layer(uint32_t il, const int32_t * experts = nullptr, size_t n = 0,
-                     const std::vector<int32_t> * next_table = nullptr);
+                     const std::vector<int32_t> * next_table = nullptr,
+                     const std::vector<int32_t> * cur_table = nullptr);
     // the expert layer after il, or -1
     int32_t next_layer(uint32_t il) const {
         if (!has(il) || (size_t) index_[il] + 1 >= entries_.size()) {
@@ -237,10 +248,14 @@ public:
     // With two staging sets, consecutive expert layers alternate between them, so the next layer's experts
     // can stream in on a second stream while the current layer's matmuls read the other set.
     int pstage_set(uint32_t il) const { return has(il) ? index_[il] % pstage_n_sets_ : 0; }
-    ggml_tensor * pstage_gate(uint32_t il)    const { return pstage_t_[pstage_set(il)][0]; }
-    ggml_tensor * pstage_up(uint32_t il)      const { return pstage_t_[pstage_set(il)][1]; }
-    ggml_tensor * pstage_down(uint32_t il)    const { return pstage_t_[pstage_set(il)][2]; }
-    ggml_tensor * pstage_gate_up(uint32_t il) const { return pstage_t_[pstage_set(il)][3]; }
+    // staging tensor of set k for role i (gate, up, down, gate_up) in the layout of entry x
+    ggml_tensor * pstage_role(int k, int i, size_t x) const {
+        return x < pstage_lay_[i].size() && pstage_lay_[i][x] >= 0 ? pstage_t_[k][i][pstage_lay_[i][x]] : nullptr;
+    }
+    ggml_tensor * pstage_gate(uint32_t il)    const { return has(il) ? pstage_role(pstage_set(il), 0, index_[il]) : nullptr; }
+    ggml_tensor * pstage_up(uint32_t il)      const { return has(il) ? pstage_role(pstage_set(il), 1, index_[il]) : nullptr; }
+    ggml_tensor * pstage_down(uint32_t il)    const { return has(il) ? pstage_role(pstage_set(il), 2, index_[il]) : nullptr; }
+    ggml_tensor * pstage_gate_up(uint32_t il) const { return has(il) ? pstage_role(pstage_set(il), 3, index_[il]) : nullptr; }
     int pstage_n_sets() const { return pstage_n_sets_; }
     // cumulative microseconds: look-ahead copies on their thread, compute thread waiting for them, and copying itself
     void pstage_times(uint64_t & copy_us, uint64_t & wait_us, uint64_t & sync_us) const;
@@ -285,6 +300,7 @@ private:
         ggml_tensor * down    = nullptr;
         ggml_tensor * gate_up = nullptr;
         ggml_tensor * slots   = nullptr;
+        ggml_tensor * state   = nullptr;
         layer_src     src;
         size_t        expert_bytes = 0;
         uint32_t      n_slot  = 0;
@@ -327,6 +343,7 @@ private:
     // i3-13100F, 480+ CPU seconds for 200 tokens). Instead, each expert is converted once on first
     // miss and the result is kept in rq_cache_ for all subsequent copies.
     ggml_type              cache_type_    = GGML_TYPE_COUNT;
+    bool                   want_state_    = false;
     std::vector<float>     requant_f32_;  // scratch for dequant->requant
 
     struct rq_precomp {
@@ -347,7 +364,11 @@ private:
     ggml_backend_buffer_type_t host_buft_  = nullptr;   // pinned host buffer type, if any
     ggml_context *             pstage_ctx_ = nullptr;
     ggml_backend_buffer_t      pstage_buf_ = nullptr;
-    ggml_tensor *              pstage_t_[2][4] = {};       // [set][gate, up, down, gate_up]
+    // [set][gate, up, down, gate_up][layout]: layers may store experts in different types (Q4_K_M keeps
+    // some ffn_down in Q6_K), so each distinct layout gets its own tensor
+    std::vector<ggml_tensor *> pstage_t_[2][4];
+    std::vector<int32_t>       pstage_lay_[4];             // layout index per entry, -1 when the role is absent
+    int64_t                    pstage_n_exp_ = 0;
     int                        pstage_n_sets_ = 1;
     ggml_backend_t             pstage_backend_ = nullptr;  // second stream, for the look-ahead copy
     ggml_backend_event_t       pstage_event_[2] = { nullptr, nullptr };
@@ -368,6 +389,8 @@ private:
     uint64_t                   n_pstaged_  = 0;
     uint64_t                   n_pstage_experts_ = 0;   // experts copied, of n_pstaged_ * n_expert possible
     std::vector<uint8_t>       pstage_used_;
+    bool                       pstage_small_ = false;   // last staged layer routed to few experts: no look-ahead
+    uint64_t                   n_pstage_routed_ = 0;    // layers staged routed-only through the worker
 
     ggml_backend_buffer_t      stage_buf_  = nullptr;
     char *                     stage_ptr_  = nullptr;
@@ -610,8 +633,8 @@ public:
 
     bool staging_now() const { return staging_now_; }
 
-    // A batch of at least this many tokens is worth the fixed cost of staging every layer once per ubatch
-    // (about one layer's experts over PCIe, 48 times); a shorter one is cheaper in cache-sized ubatches.
+    // Prompts shorter than this are cut into cache-sized ubatches. 0 (default) never cuts, so the
+    // ubatches match stock llama.cpp; BELLS_PREFILL_MIN trades that exactness for speed.
     uint32_t pstage_min_tokens() const { return pstage_min_tokens_; }
 
     bool passive() const { return params_.passive; }
@@ -630,6 +653,10 @@ public:
     // 454 tok/s with the cache allocated against 549 when it failed to allocate and took no
     // splits. Skipping the ask when inactive is free.
     bool active_now() const { return active_now_; }
+
+    // BELLS_GPU_RESOLVE=1: the graph looks up and fills the cache on the device, no routing readback
+    bool gpu_resolve() const { return gpu_resolve_; }
+    uint32_t n_expert() const { return cache_.n_expert(); }
 
     // Should this layer's routing be read this token? Layers that are not observed keep the slot
     // table they were last given, and anything routed outside it lands on the zero slot.
@@ -810,10 +837,12 @@ private:
     std::vector<bells_copy> copies_;
 
     bool     ready_      = false;
+    bool     gpu_resolve_ = false;
+    uint64_t gpu_report_  = 0;
     bool     active_now_ = false;
     bool     was_prefill_ = true;
     bool     staging_now_ = false;
-    uint32_t pstage_min_tokens_ = 192;
+    uint32_t pstage_min_tokens_ = 0;
     uint64_t n_copied_   = 0;
     uint64_t n_skipped_  = 0;   // BELLS_SKIP_MISS_RANK: weak experts left out instead of fetched
     uint64_t n_bytes_moved_ = 0;

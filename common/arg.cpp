@@ -2779,6 +2779,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BELLS"));
     add_opt(common_arg(
+        {"--no-bells"},
+        "do not turn BELLS on by itself. By default, when a MoE model does not fit in VRAM and --fit would "
+        "move expert weights to the CPU, BELLS keeps them in RAM and caches the hot ones on the GPU instead",
+        [](common_params & params) {
+            params.bells_auto    = false;
+            params.bells_enabled = false;
+        }
+    ).set_env("LLAMA_ARG_NO_BELLS"));
+    add_opt(common_arg(
         {"--bells-slots"}, "N",
         "BELLS: keep N MoE experts per layer resident in VRAM and stream the rest in on demand. "
         "Use -1 to size the cache automatically from free VRAM. Use together with --cpu-moe, "
@@ -2791,6 +2800,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // -1 means auto; the runtime treats 0 as "pick from free VRAM", and the enable
             // flag is carried separately so that 0 can still mean off at the CLI
             params.bells_enabled = value != 0;
+            params.bells_auto    = params.bells_auto && value != 0;
             params.bells_n_slot  = value > 0 ? (uint32_t) value : 0;
         }
     ).set_env("LLAMA_ARG_BELLS_SLOTS"));

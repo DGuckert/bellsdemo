@@ -99,6 +99,18 @@ One caveat on the generation rows: they use a copy of the model with its 240 BF1
 
 ## Quick start
 
+### No flags
+
+```sh
+llama-server -m model.gguf
+```
+
+Run a MoE model the way you would with stock llama.cpp. When it does not fit in VRAM, llama.cpp's `--fit` (on by default) would move expert weights to the CPU and compute them there. BELLS turns itself on at that point instead: the experts stay in RAM and the hot ones are cached on the GPU. The log says `BELLS on: ...` when it does. Output is bit-identical to stock llama.cpp with the whole model on the GPU.
+
+- It stays off when the model fits, for dense models, and when you set `--bells`, `--bells-slots`, `--cpu-moe` or `-ot` yourself.
+- It also stays off when VRAM would hold fewer than 3x the experts each token uses (for example Mixtral 8x7B on 24 GB). The cache cannot beat llama.cpp's own placement there, and the log says so.
+- `--no-bells` (or `LLAMA_ARG_NO_BELLS=1`) keeps stock llama.cpp behaviour.
+
 ### One-flag setup
 
 ```sh
@@ -158,6 +170,7 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 | `--cpu-moe` | Keep all MoE expert weights on the CPU (via mmap). Required for BELLS. Use this when the model is too large to fit in RAM â€” the OS page cache will stream from NVMe. |
 | `--cpu-moe-pinned` | Like `--cpu-moe`, but pin expert weights in physical RAM (no mmap). Faster host-to-device copies because pinned memory enables async DMA. Requires the model's expert weights to fit in RAM. |
 | `--bells` | Enable BELLS with auto-sized cache. Equivalent to `--bells-slots -1`. |
+| `--no-bells` | Do not turn BELLS on by itself when a MoE model does not fit in VRAM. See [No flags](#no-flags). |
 | `--bells-slots N` | Cache N experts per layer in VRAM. Set to `-1` to auto-size from free VRAM. More slots = higher hit rate = faster. With multiple GPUs, auto-sizing gives each device its own slot count. |
 | `--bells-l2-slots N` | Use an idle secondary GPU's VRAM as an L2 victim cache. N experts per layer on GPU 2. `-1` to auto-size. Ignored on single-GPU systems and when both GPUs are actively computing. |
 | `--bells-split K` | Run K of each token's experts on GPU, the rest on CPU concurrently. The MoE output is a weighted sum, so splitting is exact â€” no quality loss. Fewer experts need to be in the cache. Default: 0 (all through cache). |
@@ -172,10 +185,11 @@ Dense models (Llama, Mistral, Phi, etc.) are unaffected by BELLS flags.
 |---|---|
 | `GGML_CUDA_NO_PINNED=1` | Disable CUDA pinned (page-locked) host memory allocation. Use this if you see corrupted output or NaN on systems with IOMMU/DMA issues. |
 | `BELLS_ADAPT=N` | Enable adaptive pins: every N decode tokens, decay usage counters and swap the coldest resident experts for the hottest non-resident ones. Keeps the cache aligned with shifting access patterns. Try `BELLS_ADAPT=4`. |
-| `BELLS_PREFILL_STAGE=1` | Prompt staging: read long prompts in large batches instead of cache-sized ones. See [Long prompts](#long-prompts-prompt-staging). |
-| `BELLS_PREFILL_MIN=N` | Smallest batch that takes the staged path (default 192 tokens). Shorter ones go through the cache as usual. |
+| `BELLS_PREFILL_STAGE=0` | Turn prompt staging off. Prompts are then cut into cache-sized batches, which changes the output relative to stock llama.cpp. See [Long prompts](#long-prompts-prompt-staging). |
+| `BELLS_PREFILL_MIN=N` | Cut prompts shorter than N tokens into cache-sized batches. Faster on short prompts, but the output is no longer identical to stock llama.cpp. Off by default. |
 | `BELLS_PREFILL_SETS=1` | Use one staging buffer instead of two. Saves one layer's worth of VRAM and gives up copying the next layer ahead. |
 | `BELLS_PREFILL_D2D=0` | Send every staged expert from the host instead of taking the cached ones from VRAM. |
+| `BELLS_PREFILL_ROUTED=0` | Always stream whole layers ahead during prompts, even when a short prompt routes to only part of each layer. |
 | `BELLS_LAYER_STATS=file` | Print per-layer miss and coverage numbers at shutdown and save the per-expert lookup counts to `file`. |
 | `BELLS_LAYER_PROFILE=file` | Split the cache's slots between layers according to a file written by `BELLS_LAYER_STATS`, instead of equally. Layers with diffuse routing get more slots. Record the profile on prompts other than the ones you benchmark. |
 | `BELLS_PASS_TIMING=1` | Print wall time per pass by batch size, target and draft contexts apart. Diagnostic; costs a little speed. |
@@ -248,15 +262,18 @@ llama-server -m flash-next-177b-q2_0.gguf --auto --bells-reserve 1536 \
 
 ## Long prompts (prompt staging)
 
-By default a prompt goes through the expert cache in batches no larger than the cache can serve (about 20 tokens on a 24 GB card with the 177B), which is slow for long prompts. With `BELLS_PREFILL_STAGE=1` a large batch bypasses the cache: each layer's full expert stack is placed in a staging buffer just before that layer runs, and the next layer's is prepared on a second thread while the current one computes. Experts already in the cache are copied inside VRAM; only the others cross the bus.
+The cache can only serve a batch of a few tokens (about 20 on a 24 GB card with the 177B). A larger prompt batch bypasses the cache: each layer's full expert stack is placed in a staging buffer just before that layer runs, and the next layer's is prepared on a second thread while the current one computes. Experts already in the cache are copied inside VRAM; only the others cross the bus.
+
+This is on by default, so prompts are split into the same batches as stock llama.cpp and the output is bit-identical to it. llama.cpp's kernels give slightly different results for different batch widths, so cutting prompts into cache-sized batches would change the output. If the staging buffers do not fit, BELLS falls back to cache-sized batches and logs a warning.
 
 ```bash
-BELLS_PREFILL_STAGE=1 llama-server -m model.gguf --auto --bells-reserve 2200 -ub 4096 -b 4096 ...
+llama-server -m model.gguf --auto --bells-reserve 2200 -ub 4096 -b 4096 ...
 ```
 
 - It costs VRAM: two buffers of one layer's experts each (2 x 0.66 GiB on the 177B Q2_0), taken out of the cache.
 - The batch size sets the speed. `-ub 2048` is the default worth trying; `-ub 4096 -b 4096` is faster on prompts longer than 2K tokens and needs more reserve.
-- Batches under 192 tokens, and all generation, still use the cache.
+- Generation, and any prompt batch the cache can serve, still use the cache.
+- A short prompt that routes to fewer than 3/4 of a layer's experts copies only those, and nothing is streamed ahead.
 - On the A10G this took the 177B from about 200 to 700-850 prompt tok/s with generation speed unchanged.
 - CUDA only for the in-VRAM copy; other backends send every expert from the host.
 

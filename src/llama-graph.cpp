@@ -2432,14 +2432,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * bells_down  = nullptr;
     ggml_tensor * bells_gu    = nullptr;
 
-    if (bells && bells->active(n_tokens) && bells->tensors().has(il)) {
+    // Decide by the ubatch, as begin_ubatch does: the last layer keeps only the output rows, so cur can be
+    // narrower than the ubatch, and a staged prompt must not switch to the cache there.
+    const int64_t n_ubatch_tokens = (int64_t) ubatch.n_tokens;
+
+    if (bells && bells->active(n_ubatch_tokens) && bells->tensors().has(il)) {
         ggml_tensor * slots = bells->tensors().slots(il);
 
         ggml_tensor * flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts),
                                              selected_experts->ne[0]*selected_experts->ne[1], 1);
         ggml_tensor * tbl  = ggml_reshape_3d(ctx0, slots, 1, slots->ne[0], 1);
 
-        bells_ids = ggml_get_rows(ctx0, tbl, flat);
+        if (bells->gpu_resolve()) {
+            ggml_tensor * caches[3];
+            const void  * hosts[3];
+            const int n_cache = bells->tensors().cache_srcs((uint32_t) il, caches, hosts);
+            bells_ids = ggml_moe_cache(ctx0, flat, bells->tensors().state(il), caches, hosts, n_cache, (int) bells->n_expert());
+        } else {
+            bells_ids = ggml_get_rows(ctx0, tbl, flat);
+        }
         bells_ids = ggml_reshape_2d(ctx0, bells_ids,
                                     selected_experts->ne[0], selected_experts->ne[1]);
         cb(bells_ids, "ffn_moe_bells_slots", il);
@@ -2452,7 +2463,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // A prompt ubatch too wide for the cache: every layer's whole expert stack is staged on the device just
     // before the layer runs, so the matmuls read it with the original expert ids.
-    if (!bells_ids && bells && bells->staging(n_tokens) && bells->tensors().has(il)) {
+    if (!bells_ids && bells && bells->staging(n_ubatch_tokens) && bells->tensors().has(il)) {
+        // the routing is read from this copy, after the whole router: a cut at the topk node itself would
+        // split the fused topk-moe op, and the unfused router rounds differently from stock llama.cpp
+        ggml_build_forward_expand(gf, ggml_cont(ctx0, selected_experts));
         bells_gate = bells->tensors().pstage_gate(il);
         bells_up   = bells->tensors().pstage_up(il);
         bells_down = bells->tensors().pstage_down(il);

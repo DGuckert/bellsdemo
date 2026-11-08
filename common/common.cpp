@@ -1304,12 +1304,151 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 }
 
+// Zero-flag BELLS. When --fit had to move MoE experts off the GPU but every other weight still fits,
+// keep all experts on the host and cache the hot ones in VRAM instead. The cache only changes where an
+// expert's bytes live, so the output stays identical to llama.cpp. Nothing happens when the model fits,
+// when the user placed tensors or set -ngl themselves (fit leaves those alone), or with --no-bells.
+static void common_bells_auto_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
+    if (!params.bells_auto || params.bells_enabled || !params.fit_params) {
+        return;
+    }
+
+    // fit wrote its placement into params.tensor_buft_overrides
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    bool exps_on_cpu  = false;
+    bool dense_on_cpu = false;
+    int  n_cpu_layers = 0; // fit writes one pattern per layer whose experts (or a share of them) leave the GPU
+    for (const auto & o : params.tensor_buft_overrides) {
+        if (o.pattern == nullptr) {
+            break;
+        }
+        // fit moves whole expert tensors (_exps) and, for its first partial layer, a share of that layer's FFN
+        if (o.buft == cpu_buft) {
+            const bool ffn = strstr(o.pattern, "ffn_") != nullptr;
+            (ffn ? exps_on_cpu : dense_on_cpu) = true;
+            n_cpu_layers += ffn ? 1 : 0;
+        }
+    }
+    if (!exps_on_cpu) {
+        return; // the model fits, or it is not MoE
+    }
+
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr g(gguf_init_from_file(params.model.path.c_str(), gp));
+    if (!g) {
+        return;
+    }
+    const int64_t arch_id = gguf_find_key(g.get(), "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(g.get(), arch_id) != GGUF_TYPE_STRING) {
+        return;
+    }
+    const std::string arch = gguf_get_val_str(g.get(), arch_id);
+    const int64_t nl_id = gguf_find_key(g.get(), (arch + ".block_count").c_str());
+    const int64_t n_layer = nl_id >= 0 && gguf_get_kv_type(g.get(), nl_id) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g.get(), nl_id) : -1;
+
+    if (dense_on_cpu || n_layer < 0 || mparams.n_gpu_layers < n_layer + 1) {
+        LOG_INF("%s: BELLS not enabled: even without its experts the model does not fit in VRAM\n", __func__);
+        return;
+    }
+
+    // The cache gets about the VRAM fit gave to experts, less two layers for prompt staging. With room for only
+    // a few experts per layer it misses too often and is slower than fit's own placement (Mixtral on 24 GB:
+    // 4 of 8 slots, 7.7 vs 9.7 tok/s), so leave fit's placement alone there.
+    const auto get_u32 = [&](const char * key) -> int64_t {
+        const int64_t id = gguf_find_key(g.get(), (arch + key).c_str());
+        return id >= 0 && gguf_get_kv_type(g.get(), id) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g.get(), id) : -1;
+    };
+    const int64_t n_expert      = get_u32(".expert_count");
+    const int64_t n_expert_used = get_u32(".expert_used_count");
+    if (n_expert > 0 && n_expert_used > 0) {
+        const double  gpu_share = std::max(0.0, double(n_layer - n_cpu_layers - 2)/double(n_layer));
+        const int64_t est_slots = (int64_t) (gpu_share*double(n_expert));
+        if (est_slots < 3*n_expert_used) {
+            LOG_INF("%s: BELLS not enabled: VRAM holds only about %" PRId64 " of %" PRId64 " experts per layer, "
+                    "too few for a cache to beat the default placement\n", __func__, est_slots, n_expert);
+            return;
+        }
+    }
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (params.speculative.has_dft() || spec_mtp) {
+        LOG_INF("%s: BELLS not enabled automatically with a draft model; use --auto with --bells-reserve\n", __func__);
+        return;
+    }
+
+    // pinned host memory needs the whole file in RAM (no mmap); stream from disk when it would not fit
+    uint64_t file_bytes = 0;
+    {
+        int split_count = 1;
+        const int64_t sc_id = gguf_find_key(g.get(), "split.count");
+        if (sc_id >= 0 && gguf_get_kv_type(g.get(), sc_id) == GGUF_TYPE_UINT16) {
+            split_count = std::max<int>(1, gguf_get_val_u16(g.get(), sc_id));
+        }
+        std::vector<std::string> files = { params.model.path };
+        if (split_count > 1) {
+            char prefix[4096] = {};
+            if (llama_split_prefix(prefix, sizeof(prefix), params.model.path.c_str(), 0, split_count) > 0) {
+                files.clear();
+                for (int i = 0; i < split_count; ++i) {
+                    char path[4096] = {};
+                    llama_split_path(path, sizeof(path), prefix, i, split_count);
+                    files.emplace_back(path);
+                }
+            }
+        }
+        for (const auto & f : files) {
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(f, ec);
+            file_bytes += ec ? 0 : (uint64_t) sz;
+        }
+    }
+    size_t ram_free = 0;
+    size_t ram_total = 0;
+    if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
+    }
+    auto ov = llm_ffn_exps_pinned_override();
+    const bool pinned = ov.buft != nullptr && file_bytes > 0 && file_bytes + (2ull << 30) < ram_free;
+    if (!pinned) {
+        ov = llm_ffn_exps_cpu_override();
+    }
+
+    const int32_t  n_gpu_layers = mparams.n_gpu_layers;
+    const uint32_t n_ctx        = cparams.n_ctx;
+
+    const size_t ntbo = params.tensor_buft_overrides.size();
+    params.tensor_buft_overrides.assign(ntbo, { nullptr, nullptr });
+    params.tensor_buft_overrides[0] = ov;
+    params.n_gpu_layers  = n_gpu_layers;
+    params.bells_enabled = true;
+    params.bells_n_slot  = 0;
+    if (params.bells_adapt == 0) {
+        params.bells_adapt = 32;
+    }
+    if (pinned) {
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
+
+    mparams = common_model_params_to_llama(params);
+    cparams = common_context_params_to_llama(params);
+    cparams.n_ctx = n_ctx;
+
+    LOG_INF("%s: BELLS on: the MoE experts do not fit in VRAM, so they stay in %s and the hot ones are cached "
+            "on the GPU. Output is identical to llama.cpp. Turn off with --no-bells\n",
+            __func__, pinned ? "pinned RAM" : "RAM (streamed from disk, the model is larger than free RAM)");
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // fit leaves placements set by the user (-ot, --cpu-moe) alone; BELLS must not read them as fit's and replace them
+    const bool user_tbo = !params.tensor_buft_overrides.empty() && params.tensor_buft_overrides[0].pattern != nullptr;
     common_fit_apply(params, mparams, cparams);
+    if (!user_tbo) {
+        common_bells_auto_apply(params, mparams, cparams);
+    }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {

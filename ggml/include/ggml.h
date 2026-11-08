@@ -613,6 +613,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_MOE_CACHE,
 
         GGML_OP_COUNT,
     };
@@ -1540,6 +1541,23 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // expert cache with on-device fill
+    // ids:    [n_used, n_tokens] I32 expert ids
+    // state:  I32, at least ggml_moe_cache_state_size(n_expert, n_slot) elements
+    // caches: 1 to 3 tensors [ne0, ne1, n_slot + 1], slot n_slot stays zero
+    // hosts:  device-readable (pinned) host data of all experts, same type and layout as the caches
+    // result: I32 slot ids, same shape as ids; the op copies missing experts into the caches
+    GGML_API struct ggml_tensor * ggml_moe_cache(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * state,
+            struct ggml_tensor ** caches,
+            const void         ** hosts,
+            int                   n_cache,
+            int                   n_expert);
+
+    GGML_API int64_t ggml_moe_cache_state_size(int n_expert, int n_slot);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

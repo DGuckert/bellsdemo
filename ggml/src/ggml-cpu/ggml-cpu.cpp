@@ -440,6 +440,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_MOE_CACHE:
+            return op->src[1]->buffer && ggml_backend_buffer_is_host(op->src[1]->buffer);
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

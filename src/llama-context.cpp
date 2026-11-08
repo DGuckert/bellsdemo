@@ -887,8 +887,9 @@ llama_context::llama_context(
             // With prompt staging the big ubatch stays for long prompts, and decode() picks per batch.
             if (bells && bells->ready() && !bells->passive() && bells->max_tokens() > 0 &&
                 !bells->tensors().pstage_ready() && cparams.n_ubatch > bells->max_tokens()) {
-                LLAMA_LOG_INFO("%s: BELLS: n_ubatch %u -> %u so prompts stay on the expert cache\n",
-                               __func__, cparams.n_ubatch, bells->max_tokens());
+                LLAMA_LOG_WARN("%s: BELLS: n_ubatch %u -> %u so prompts stay on the expert cache; "
+                               "output differs from stock llama.cpp at -ub %u (prompt staging is off)\n",
+                               __func__, cparams.n_ubatch, bells->max_tokens(), cparams.n_ubatch);
                 cparams.n_ubatch = bells->max_tokens();
             }
 
@@ -1921,13 +1922,14 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
         }
     }
 
-    // While the cache serves this ubatch, read the routing from the contiguous copy that
-    // build_moe_ffn makes for the slot lookup ("ffn_moe_topk-<il> (cont)") instead of from the
-    // topk node. The copy comes after the whole router, so the graph is not cut in the middle of
+    // While the cache serves this ubatch, or a prompt is staged, read the routing from the contiguous
+    // copy that build_moe_ffn makes ("ffn_moe_topk-<il> (cont)") instead of from the topk node. The
+    // copy comes after the whole router, so the graph is not cut in the middle of
     // softmax -> argsort -> get_rows -> norm and the backend can run it as one fused topk-moe op.
+    // That fused op rounds differently from the unfused one, so the cut there also broke exactness.
     // BELLS_SPLIT_AT_TOPK=1 restores the cut at the topk node.
     static const bool split_at_topk = getenv("BELLS_SPLIT_AT_TOPK") != nullptr;
-    if (bells && bells->ready() && bells->active_now() && !split_at_topk) {
+    if (bells && bells->ready() && (bells->active_now() || bells->staging_now()) && !split_at_topk) {
         static const char * csuffix = " (cont)";
         bool is_cont = t->op == GGML_OP_CONT && t->type == GGML_TYPE_I32 && strncmp(t->name, prefix, plen) == 0;
         if (is_cont) {
@@ -1946,6 +1948,11 @@ bool llama_context::bells_eval(ggml_tensor * t, bool ask) {
     // The one exception is prompt staging: it needs the cut at every layer, to load that layer's experts.
     const bool staging = bells && bells->ready() && bells->staging_now();
     if (is_topk && bells && bells->ready() && !bells->active_now() && !staging) {
+        is_topk = false;
+    }
+
+    // BELLS_GPU_RESOLVE: the graph fills the cache itself, the routing is not needed on the host
+    if (is_topk && bells && bells->ready() && bells->active_now() && bells->gpu_resolve()) {
         is_topk = false;
     }
 

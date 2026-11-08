@@ -586,6 +586,7 @@ struct common_params {
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
     bool        bells_enabled = false; // BELLS on at all
+    bool        bells_auto = true;  // turn BELLS on by itself when --fit moves MoE experts off the GPU
     uint32_t    bells_n_slot = 0;   // MoE experts resident per layer, 0 = size from free VRAM
     bool        bells_passive = false; // research: allocate and split, but do not use the cache
     uint32_t    bells_refresh = 1;  // observe a rotating 1/N of MoE layers per token

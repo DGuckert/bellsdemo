@@ -709,6 +709,90 @@ void ggml_compute_forward_add(
     }
 }
 
+// ggml_compute_forward_moe_cache
+
+// same plan as the CUDA kernel: hits first, then LRU victims for the first occurrence of each miss
+void ggml_compute_forward_moe_cache(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * ids = dst->src[0];
+
+    const int n_expert = ggml_get_op_params_i32(dst, 0);
+    const int n_cache  = ggml_get_op_params_i32(dst, 1);
+    const int n_slot   = (int) dst->src[2]->ne[2] - 1;
+    const int n_ids    = (int) ggml_nelements(ids);
+
+    int32_t * map    = (int32_t *) dst->src[1]->data;
+    int32_t * rev    = map    + n_expert;
+    int32_t * stamp  = rev    + n_slot;
+    int32_t * miss_e = stamp  + n_slot;
+    int32_t * miss_s = miss_e + n_slot;
+    int32_t * hdr    = miss_s + n_slot;
+
+    const int32_t * id  = (const int32_t *) ids->data;
+    int32_t       * out = (int32_t *) dst->data;
+
+    const int32_t clock = ++hdr[0];
+
+    for (int i = 0; i < n_ids; ++i) {
+        const int32_t e = id[i];
+        if (e >= 0 && e < n_expert && map[e] >= 0) {
+            stamp[map[e]] = clock;
+            hdr[2]++;
+        }
+    }
+
+    int n_miss = 0;
+    for (int i = 0; i < n_ids && n_miss < n_slot; ++i) {
+        const int32_t e = id[i];
+        if (e < 0 || e >= n_expert || map[e] >= 0) {
+            continue;
+        }
+        int32_t v = -1;
+        for (int s = 0; s < n_slot; ++s) {
+            if (stamp[s] != clock && (v < 0 || (uint32_t) stamp[s] < (uint32_t) stamp[v])) {
+                v = s;
+            }
+        }
+        miss_e[n_miss] = e;
+        miss_s[n_miss] = v;
+        n_miss++;
+        if (v < 0) {
+            continue;
+        }
+        if (rev[v] >= 0) {
+            map[rev[v]] = -1;
+        }
+        rev[v]   = e;
+        map[e]   = v;
+        stamp[v] = clock;
+        hdr[3]++;
+
+        for (int c = 0; c < n_cache; ++c) {
+            const ggml_tensor * t = dst->src[2 + c];
+            const char * host = nullptr;
+            memcpy(&host, (const int32_t *) dst->op_params + 2 + 2*c, sizeof(void *));
+            memcpy((char *) t->data + (size_t) v*t->nb[2], host + (size_t) e*t->nb[2], t->nb[2]);
+        }
+    }
+
+    for (int i = 0; i < n_ids; ++i) {
+        const int32_t e = id[i];
+        const int32_t s = (e >= 0 && e < n_expert) ? map[e] : -1;
+        out[i] = s >= 0 ? s : n_slot;
+        if (s < 0) {
+            hdr[4]++;
+        }
+    }
+
+    hdr[1] += n_ids;
+    hdr[5]  = n_miss;
+}
+
 // ggml_compute_forward_add_id
 
 static void ggml_compute_forward_add_id_f32(

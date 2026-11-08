@@ -25,6 +25,12 @@ static bool bells_env_on(const char * name) {
     return value && value[0] && value[0] != '0';
 }
 
+// Prompt staging is on unless BELLS_PREFILL_STAGE=0. Without it a prompt is cut into cache-sized
+// ubatches, and llama.cpp kernels are not batch-invariant, so the output would differ from stock.
+static bool bells_prefill_stage_wanted() {
+    return !getenv("BELLS_PREFILL_STAGE") || bells_env_on("BELLS_PREFILL_STAGE");
+}
+
 void bells_cache::init(uint32_t n_layer, uint32_t n_expert, uint32_t n_slot) {
     std::vector<uint32_t> per_layer(n_layer, std::min(n_slot, n_expert));
     init(n_layer, n_expert, per_layer);
@@ -660,6 +666,9 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
 
             e.slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, any->ne[2]);
             ggml_set_input(e.slots);
+            if (want_state_ && ns > 0) {
+                e.state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ggml_moe_cache_state_size((int) any->ne[2], (int) ns));
+            }
 
             index_[s.il] = (int32_t) entries_.size();
             entries_.push_back(e);
@@ -711,6 +720,12 @@ bool bells_tensors::init(ggml_backend_buffer_type_t buft, const std::vector<laye
                     ggml_backend_tensor_set(t, zeros.data(), (size_t) s*stride, stride);
                 }
             }
+        }
+    }
+
+    for (const auto & e : entries_) {
+        if (e.state) {
+            state_upload((uint32_t) e.src.il, {});
         }
     }
 
@@ -1029,11 +1044,22 @@ void bells_tensors::warm_lookahead(uint32_t il_next) {
 }
 
 size_t bells_tensors::pstage_bytes(const std::vector<layer_src> & srcs) {
+    // one tensor per distinct layout of each role, as init_pstage allocates them
     size_t total = 0;
-    if (!srcs.empty()) {
-        for (ggml_tensor * t : { srcs[0].gate, srcs[0].up, srcs[0].down, srcs[0].gate_up }) {
-            if (t) {
-                total += ggml_nbytes(t);
+    std::vector<const ggml_tensor *> seen[4];
+    for (const auto & s : srcs) {
+        const ggml_tensor * cur[4] = { s.gate, s.up, s.down, s.gate_up };
+        for (int i = 0; i < 4; ++i) {
+            if (!cur[i]) {
+                continue;
+            }
+            bool found = false;
+            for (const ggml_tensor * t : seen[i]) {
+                found = found || (t->type == cur[i]->type && ggml_are_same_shape(t, cur[i]));
+            }
+            if (!found) {
+                seen[i].push_back(cur[i]);
+                total += ggml_nbytes(cur[i]);
             }
         }
     }
@@ -1089,19 +1115,46 @@ bool bells_tensors::init_pstage(ggml_backend_buffer_type_t buft) {
     if (entries_.empty() || cache_type_ != GGML_TYPE_COUNT || buffers_.size() > 1) {
         return false;
     }
-    // one staging copy serves every layer, so every layer's expert tensors must have one layout
+    // every layer must have the same roles and expert count; types and shapes may differ per layer
     const layer_src & s0 = entries_[0].src;
     ggml_tensor * tmpl[4] = { s0.gate, s0.up, s0.down, s0.gate_up };
-    for (const auto & e : entries_) {
-        ggml_tensor * cur[4] = { e.src.gate, e.src.up, e.src.down, e.src.gate_up };
+    std::vector<ggml_tensor *> layouts[4];   // one source tensor per distinct (type, shape)
+    size_t max_stride[4] = {};
+    pstage_n_exp_ = 0;
+    for (int i = 0; i < 4; ++i) {
+        pstage_lay_[i].assign(entries_.size(), -1);
+        if (tmpl[i]) {
+            pstage_n_exp_ = tmpl[i]->ne[2];
+        }
+    }
+    for (size_t x = 0; x < entries_.size(); ++x) {
+        const layer_src & s = entries_[x].src;
+        ggml_tensor * cur[4] = { s.gate, s.up, s.down, s.gate_up };
         for (int i = 0; i < 4; ++i) {
             if ((cur[i] == nullptr) != (tmpl[i] == nullptr)) {
                 return false;
             }
-            if (cur[i] && (cur[i]->type != tmpl[i]->type || !ggml_are_same_shape(cur[i], tmpl[i]) || !cur[i]->data)) {
+            if (!cur[i]) {
+                continue;
+            }
+            if (!cur[i]->data || cur[i]->ne[2] != pstage_n_exp_) {
                 return false;
             }
+            int32_t j = 0;
+            while (j < (int32_t) layouts[i].size() &&
+                   !(layouts[i][j]->type == cur[i]->type && ggml_are_same_shape(layouts[i][j], cur[i]))) {
+                ++j;
+            }
+            if (j == (int32_t) layouts[i].size()) {
+                layouts[i].push_back(cur[i]);
+            }
+            pstage_lay_[i][x] = j;
+            max_stride[i] = std::max(max_stride[i], ggml_nbytes(cur[i])/(size_t) pstage_n_exp_);
         }
+    }
+    size_t n_layouts = 0;
+    for (const auto & l : layouts) {
+        n_layouts += l.size();
     }
 
     // The second set needs its own stream and one event per set; without them fall back to one set.
@@ -1120,21 +1173,23 @@ bool bells_tensors::init_pstage(ggml_backend_buffer_type_t buft) {
         }
     }
 
-    pstage_ctx_ = ggml_init({ ggml_tensor_overhead()*16, nullptr, true });
+    pstage_ctx_ = ggml_init({ ggml_tensor_overhead()*(2*n_layouts + 16), nullptr, true });
     if (!pstage_ctx_) {
         return false;
     }
     for (int k = 0; k < pstage_n_sets_; ++k) {
         for (int i = 0; i < 4; ++i) {
-            if (tmpl[i]) {
-                pstage_t_[k][i] = ggml_new_tensor_3d(pstage_ctx_, tmpl[i]->type, tmpl[i]->ne[0], tmpl[i]->ne[1], tmpl[i]->ne[2]);
+            pstage_t_[k][i].clear();
+            for (ggml_tensor * l : layouts[i]) {
+                pstage_t_[k][i].push_back(ggml_new_tensor_3d(pstage_ctx_, l->type, l->ne[0], l->ne[1], l->ne[2]));
             }
         }
     }
+    // byte views, resized per copy, since an expert's size depends on its layer's layout
     for (int i = 0; i < 4; ++i) {
         if (tmpl[i] && pstage_n_sets_ == 2) {
-            pstage_view_src_[i] = ggml_new_tensor_3d(pstage_ctx_, tmpl[i]->type, tmpl[i]->ne[0], tmpl[i]->ne[1], 1);
-            pstage_view_dst_[i] = ggml_new_tensor_3d(pstage_ctx_, tmpl[i]->type, tmpl[i]->ne[0], tmpl[i]->ne[1], 1);
+            pstage_view_src_[i] = ggml_new_tensor_1d(pstage_ctx_, GGML_TYPE_I8, (int64_t) max_stride[i]);
+            pstage_view_dst_[i] = ggml_new_tensor_1d(pstage_ctx_, GGML_TYPE_I8, (int64_t) max_stride[i]);
         }
     }
     ggml_backend_buffer_type_t target = s0.buft ? s0.buft : buft;
@@ -1144,7 +1199,7 @@ bool bells_tensors::init_pstage(ggml_backend_buffer_type_t buft) {
         pstage_ctx_ = nullptr;
         for (auto & set : pstage_t_) {
             for (auto & t : set) {
-                t = nullptr;
+                t.clear();
             }
         }
         return false;
@@ -1178,6 +1233,10 @@ bool bells_tensors::init_pstage(ggml_backend_buffer_type_t buft) {
                     } else if (!op.map.empty()) {
                         gather(be, op.dst, op.cache, op.map.data(), (int) op.map.size(), op.size);
                     } else {
+                        for (ggml_tensor * v : { vs[op.i], vd[op.i] }) {
+                            v->ne[0] = (int64_t) op.size;
+                            v->nb[1] = v->nb[2] = v->nb[3] = op.size;
+                        }
                         vs[op.i]->buffer = op.cache->buffer;
                         vs[op.i]->data   = (char *) op.cache->data + op.src_off;
                         vd[op.i]->buffer = op.dst->buffer;
@@ -1204,14 +1263,18 @@ int bells_tensors::pstage_sets_wanted() {
     return (s && atoi(s) == 1) ? 1 : 2;
 }
 
-void bells_tensors::stage_layer(uint32_t il, const int32_t * experts, size_t n, const std::vector<int32_t> * next_table) {
+void bells_tensors::stage_layer(uint32_t il, const int32_t * experts, size_t n, const std::vector<int32_t> * next_table,
+                                const std::vector<int32_t> * cur_table) {
     if (!pstage_buf_ || !has(il)) {
         return;
     }
     const layer_src & s = get(il).src;
     ggml_tensor * src[4] = { s.gate, s.up, s.down, s.gate_up };
     const int k = pstage_set(il);
-    ggml_tensor ** pstage_cur = pstage_t_[k];
+    ggml_tensor * pstage_cur[4];
+    for (int i = 0; i < 4; ++i) {
+        pstage_cur[i] = pstage_role(k, i, (size_t) index_[il]);
+    }
 
     ggml_tensor * any = nullptr;
     for (ggml_tensor * t : src) {
@@ -1224,10 +1287,127 @@ void bells_tensors::stage_layer(uint32_t il, const int32_t * experts, size_t n, 
     }
     const int64_t n_exp = any->ne[2];
 
+    // Resident experts come out of the cache in one gather launch, only the others cross the bus.
+    // BELLS_PREFILL_D2D=0 sends everything from the host; =1 copies resident experts one by one, which is
+    // what a backend without the gather would do and measured slower than the host (1125-token prompt
+    // 1.61 s -> 2.06 s).
+    static const char * d2d_env = getenv("BELLS_PREFILL_D2D");
+    static const int d2d_mode = d2d_env ? atoi(d2d_env) : (pstage_gather_ ? 2 : 0);
+    const bool no_d2d = d2d_mode == 0 || (d2d_mode == 2 && !pstage_gather_);
+
+    // The copies that fill set kdst with entry idx's experts. used: which experts, null for all. table: the
+    // entry's expert -> slot table, whose resident experts are taken from the cache.
+    const auto make_job = [&](size_t idx, int kdst, const std::vector<int32_t> * table, const uint8_t * used,
+                              std::vector<bells_pstage_op> & job) {
+        const entry & en = entries_[idx];
+        const layer_src & sn = en.src;
+        ggml_tensor * srcn[4]   = { sn.gate, sn.up, sn.down, sn.gate_up };
+        ggml_tensor * cachen[4] = { en.gate, en.up, en.down, en.gate_up };
+        for (int i = 0; i < 4; ++i) {
+            ggml_tensor * dst = pstage_role(kdst, i, idx);
+            if (!srcn[i] || !dst) {
+                continue;
+            }
+            const bool count  = i == 3 || !srcn[3];
+            const size_t stride = ggml_nbytes(srcn[i])/(size_t) n_exp;
+            const bool use_cache = !no_d2d && table && cachen[i] && pstage_view_src_[i] && pstage_view_dst_[i] &&
+                                   (int64_t) table->size() >= n_exp && cachen[i]->type == srcn[i]->type &&
+                                   ggml_nbytes(cachen[i])/(size_t) cachen[i]->ne[2] == stride;
+            if (!use_cache && !used) {
+                bells_pstage_op op;
+                op.dst  = dst;
+                op.host = srcn[i]->data;
+                op.size = ggml_nbytes(srcn[i]);
+                job.push_back(op);
+                if (count) {
+                    n_pstage_h2d_ += (uint64_t) n_exp;
+                }
+                continue;
+            }
+            // each run of wanted, non-resident experts is one host copy
+            bells_pstage_op gop;
+            const bool gather = use_cache && d2d_mode == 2;
+            if (gather) {
+                gop.dst   = dst;
+                gop.cache = cachen[i];
+                gop.size  = stride;
+                gop.map.assign((size_t) n_exp, -1);
+            }
+            int64_t run0 = -1;
+            for (int64_t x = 0; x <= n_exp; ++x) {
+                const bool want = x < n_exp && (!used || used[x]);
+                const int32_t slot = want && use_cache ? (*table)[x] : -1;
+                const bool resident = slot >= 0 && (uint32_t) slot < en.n_slot;
+                if (want && !resident) {
+                    if (run0 < 0) {
+                        run0 = x;
+                    }
+                    continue;
+                }
+                if (run0 >= 0) {
+                    bells_pstage_op op;
+                    op.dst     = dst;
+                    op.host    = (const char *) srcn[i]->data + (size_t) run0*stride;
+                    op.dst_off = (size_t) run0*stride;
+                    op.size    = (size_t) (x - run0)*stride;
+                    job.push_back(op);
+                    if (count) {
+                        n_pstage_h2d_ += (uint64_t) (x - run0);
+                    }
+                    run0 = -1;
+                }
+                if (resident && gather) {
+                    gop.map[(size_t) x] = slot;
+                } else if (resident) {
+                    bells_pstage_op op;
+                    op.dst     = dst;
+                    op.cache   = cachen[i];
+                    op.i       = i;
+                    op.dst_off = (size_t) x*stride;
+                    op.src_off = (size_t) slot*stride;
+                    op.size    = stride;
+                    job.push_back(op);
+                }
+                if (resident && count) {
+                    n_pstage_d2d_++;
+                }
+            }
+            if (gather) {
+                job.push_back(std::move(gop));
+            }
+        }
+    };
+
+    const auto submit = [&](std::vector<bells_pstage_op> & job) {
+        {
+            std::lock_guard<std::mutex> lock(pstage_w_->mu);
+            pstage_w_->job.swap(job);
+            pstage_w_->ready = true;
+        }
+        pstage_w_->cv.notify_all();
+    };
+
+    // The experts this ubatch routes to. A short prompt routes to only part of each layer: then the next
+    // layer's full stack is not worth streaming ahead, and this layer copies just its routed experts.
+    // BELLS_PREFILL_ROUTED=0 always streams whole layers ahead.
+    static const char * routed_env = getenv("BELLS_PREFILL_ROUTED");
+    static const bool routed_ok = !routed_env || atoi(routed_env) != 0;
+    pstage_used_.assign((size_t) n_exp, experts == nullptr ? 1 : 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (experts[i] >= 0 && experts[i] < n_exp) {
+            pstage_used_[experts[i]] = 1;
+        }
+    }
+    int64_t n_used = 0;
+    for (uint8_t u : pstage_used_) {
+        n_used += u;
+    }
+    pstage_small_ = routed_ok && experts != nullptr && 4*n_used < 3*n_exp;
+
     // Start the next expert layer's whole stack into the other set. The caller runs after the compute stream
     // was synchronised, so the layer that last read that set is done with it.
     const auto look_ahead = [&]() {
-        if (pstage_n_sets_ < 2) {
+        if (pstage_n_sets_ < 2 || pstage_small_) {
             return;
         }
         const size_t idx = (size_t) index_[il] + 1;
@@ -1242,96 +1422,8 @@ void bells_tensors::stage_layer(uint32_t il, const int32_t * experts, size_t n, 
         pstage_wait();
         pstage_pending_[0] = pstage_pending_[1] = false;
         std::vector<bells_pstage_op> job;
-        const entry & en = entries_[idx];
-        const layer_src & sn = en.src;
-        ggml_tensor * srcn[4]   = { sn.gate, sn.up, sn.down, sn.gate_up };
-        ggml_tensor * cachen[4] = { en.gate, en.up, en.down, en.gate_up };
-        // The next layer's resident experts come out of the cache in one gather launch, only the others cross
-        // the bus. BELLS_PREFILL_D2D=0 sends everything from the host; =1 copies resident experts one by one,
-        // which is what a backend without the gather would do and measured slower than the host
-        // (1125-token prompt 1.61 s -> 2.06 s).
-        static const char * d2d_env = getenv("BELLS_PREFILL_D2D");
-        static const int d2d_mode = d2d_env ? atoi(d2d_env) : (pstage_gather_ ? 2 : 0);
-        const bool no_d2d = d2d_mode == 0 || (d2d_mode == 2 && !pstage_gather_);
-        for (int i = 0; i < 4; ++i) {
-            ggml_tensor * dst = pstage_t_[k2][i];
-            if (!srcn[i] || !dst) {
-                continue;
-            }
-            const size_t stride = ggml_nbytes(srcn[i])/(size_t) n_exp;
-            const bool use_cache = !no_d2d && next_table && cachen[i] && pstage_view_src_[i] && pstage_view_dst_[i] &&
-                                   (int64_t) next_table->size() >= n_exp && cachen[i]->type == srcn[i]->type &&
-                                   ggml_nbytes(cachen[i])/(size_t) cachen[i]->ne[2] == stride;
-            if (!use_cache) {
-                bells_pstage_op op;
-                op.dst  = dst;
-                op.host = srcn[i]->data;
-                op.size = ggml_nbytes(srcn[i]);
-                job.push_back(op);
-                if (i == 3 || !srcn[3]) {
-                    n_pstage_h2d_ += (uint64_t) n_exp;
-                }
-                continue;
-            }
-            // resident experts come from the cache; each run of the others is one host copy
-            bells_pstage_op gop;
-            if (d2d_mode == 2) {
-                gop.dst   = dst;
-                gop.cache = cachen[i];
-                gop.size  = stride;
-                gop.map.assign((size_t) n_exp, -1);
-            }
-            int64_t run0 = -1;
-            for (int64_t x = 0; x <= n_exp; ++x) {
-                const int32_t slot = x < n_exp ? (*next_table)[x] : -1;
-                const bool resident = x < n_exp && slot >= 0 && (uint32_t) slot < en.n_slot;
-                if (x < n_exp && !resident) {
-                    if (run0 < 0) {
-                        run0 = x;
-                    }
-                    continue;
-                }
-                if (run0 >= 0) {
-                    bells_pstage_op op;
-                    op.dst     = dst;
-                    op.host    = (const char *) srcn[i]->data + (size_t) run0*stride;
-                    op.dst_off = (size_t) run0*stride;
-                    op.size    = (size_t) (x - run0)*stride;
-                    job.push_back(op);
-                    if (i == 3 || !srcn[3]) {
-                        n_pstage_h2d_ += (uint64_t) (x - run0);
-                    }
-                    run0 = -1;
-                }
-                if (resident && d2d_mode == 2) {
-                    gop.map[(size_t) x] = slot;
-                    if (i == 3 || !srcn[3]) {
-                        n_pstage_d2d_++;
-                    }
-                } else if (resident) {
-                    bells_pstage_op op;
-                    op.dst     = dst;
-                    op.cache   = cachen[i];
-                    op.i       = i;
-                    op.dst_off = (size_t) x*stride;
-                    op.src_off = (size_t) slot*stride;
-                    op.size    = stride;
-                    job.push_back(op);
-                    if (i == 3 || !srcn[3]) {
-                        n_pstage_d2d_++;
-                    }
-                }
-            }
-            if (d2d_mode == 2) {
-                job.push_back(std::move(gop));
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lock(pstage_w_->mu);
-            pstage_w_->job.swap(job);
-            pstage_w_->ready = true;
-        }
-        pstage_w_->cv.notify_all();
+        make_job(idx, k2, next_table, nullptr, job);
+        submit(job);
         pstage_pending_[k2] = true;
         pstage_layer_[k2]   = next;
     };
@@ -1359,13 +1451,7 @@ void bells_tensors::stage_layer(uint32_t il, const int32_t * experts, size_t n, 
     // a routed-only load is partial: never let a later ubatch take this set for a full copy of the layer
     pstage_layer_[k] = -1;
 
-    // The experts this ubatch routes to. The rest keep whatever another layer left there, which nothing reads.
-    pstage_used_.assign((size_t) n_exp, experts == nullptr ? 1 : 0);
-    for (size_t i = 0; i < n; ++i) {
-        if (experts[i] >= 0 && experts[i] < n_exp) {
-            pstage_used_[experts[i]] = 1;
-        }
-    }
+    // The rest keep whatever another layer left there, which nothing reads.
     // a gap of one or two unused experts is cheaper to copy than to split the transfer around
     for (int64_t x = 1; x + 1 < n_exp; ++x) {
         if (!pstage_used_[x] && pstage_used_[x - 1] && (pstage_used_[x + 1] || (x + 2 < n_exp && pstage_used_[x + 2]))) {
@@ -1373,24 +1459,36 @@ void bells_tensors::stage_layer(uint32_t il, const int32_t * experts, size_t n, 
         }
     }
 
-    for (int64_t a = 0; a < n_exp; ) {
-        if (!pstage_used_[a]) {
-            ++a;
-            continue;
+    if (pstage_w_) {
+        // on the worker's stream, so resident experts come from the cache too
+        std::vector<bells_pstage_op> job;
+        make_job((size_t) index_[il], k, cur_table, pstage_used_.data(), job);
+        submit(job);
+        pstage_wait();
+        for (uint8_t u : pstage_used_) {
+            n_pstage_experts_ += u;
         }
-        int64_t b = a;
-        while (b < n_exp && pstage_used_[b]) {
-            ++b;
-        }
-        for (int i = 0; i < 4; ++i) {
-            if (src[i] && pstage_cur[i]) {
-                const size_t stride = ggml_nbytes(src[i])/(size_t) n_exp;
-                ggml_backend_tensor_set(pstage_cur[i], (const char *) src[i]->data + (size_t) a*stride,
-                                        (size_t) a*stride, (size_t) (b - a)*stride);
+        n_pstage_routed_++;
+    } else {
+        for (int64_t a = 0; a < n_exp; ) {
+            if (!pstage_used_[a]) {
+                ++a;
+                continue;
             }
+            int64_t b = a;
+            while (b < n_exp && pstage_used_[b]) {
+                ++b;
+            }
+            for (int i = 0; i < 4; ++i) {
+                if (src[i] && pstage_cur[i]) {
+                    const size_t stride = ggml_nbytes(src[i])/(size_t) n_exp;
+                    ggml_backend_tensor_set(pstage_cur[i], (const char *) src[i]->data + (size_t) a*stride,
+                                            (size_t) a*stride, (size_t) (b - a)*stride);
+                }
+            }
+            n_pstage_experts_ += (uint64_t) (b - a);
+            a = b;
         }
-        n_pstage_experts_ += (uint64_t) (b - a);
-        a = b;
     }
     n_pstaged_++;
     pstage_sync_us_ += (uint64_t) (ggml_time_us() - t_sync0);
@@ -1418,12 +1516,11 @@ void bells_tensors::free() {
             ggml_backend_synchronize(pstage_backend_);
         }
         if (n_pstaged_ > 0 && !entries_.empty()) {
-            const ggml_tensor * any = pstage_t_[0][3] ? pstage_t_[0][3] : pstage_t_[0][2];
-            const double n_exp = any ? (double) any->ne[2] : 1.0;
+            const double n_exp = pstage_n_exp_ > 0 ? (double) pstage_n_exp_ : 1.0;
             fprintf(stderr, "bells_tensors: staged %llu layer loads for prompt batches, %.1f%% of their experts copied, "
-                            "%llu arrived by look-ahead (%llu experts from the cache, %llu from the host)\n",
+                            "%llu arrived by look-ahead, %llu routed-only (%llu experts from the cache, %llu from the host)\n",
                     (unsigned long long) n_pstaged_, 100.0*(double) n_pstage_experts_/((double) n_pstaged_*n_exp),
-                    (unsigned long long) n_pstage_ahead_, (unsigned long long) n_pstage_d2d_, (unsigned long long) n_pstage_h2d_);
+                    (unsigned long long) n_pstage_ahead_, (unsigned long long) n_pstage_routed_, (unsigned long long) n_pstage_d2d_, (unsigned long long) n_pstage_h2d_);
             fprintf(stderr, "bells_tensors: staging time: look-ahead copies %.0f ms on their own thread, compute thread waited "
                             "%.0f ms for them and copied %.0f ms itself\n",
                     pstage_copy_us/1000.0, pstage_wait_us_/1000.0, pstage_sync_us_/1000.0);
@@ -1447,10 +1544,11 @@ void bells_tensors::free() {
     }
     for (auto & set : pstage_t_) {
         for (auto & t : set) {
-            t = nullptr;
+            t.clear();
         }
     }
     for (int i = 0; i < 4; ++i) {
+        pstage_lay_[i].clear();
         pstage_view_src_[i] = nullptr;
         pstage_view_dst_[i] = nullptr;
     }
@@ -2045,6 +2143,141 @@ bool bells_tensors::slot_matches_expert(uint32_t il, int32_t expert, int32_t slo
     return memcmp(got.data(), want, n_cmp) == 0;
 }
 
+static int64_t bells_src_n_expert(const bells_tensors::layer_src & s) {
+    const ggml_tensor * t = s.gate ? s.gate : (s.gate_up ? s.gate_up : s.up);
+    return t ? t->ne[2] : 0;
+}
+
+int bells_tensors::cache_srcs(uint32_t il, ggml_tensor ** caches, const void ** hosts) const {
+    const entry & e = get(il);
+    int n = 0;
+    const std::pair<ggml_tensor *, ggml_tensor *> pairs[] = {
+        { e.gate, e.src.gate }, { e.up, e.src.up }, { e.gate_up, e.src.gate_up }, { e.down, e.src.down },
+    };
+    for (const auto & [c, h] : pairs) {
+        if (c && h && n < 3) {
+            caches[n] = c;
+            hosts[n]  = h->data;
+            n++;
+        }
+    }
+    return n;
+}
+
+bool bells_tensors::gpu_state_ok(std::string & why) const {
+    if (entries_.empty() || buffers_.size() != 1 || !backend_) {
+        why = "needs one GPU";
+        return false;
+    }
+    if (cache_type_ != GGML_TYPE_COUNT) {
+        why = "the cache re-quantizes experts";
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend_);
+    ggml_backend_buffer_type_t host = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (!host) {
+        why = "the device has no pinned host memory";
+        return false;
+    }
+
+    for (const auto & e : entries_) {
+        if (!e.state) {
+            why = "a layer has no slots";
+            return false;
+        }
+        ggml_tensor * caches[3];
+        const void  * hosts[3];
+        const int n = cache_srcs((uint32_t) e.src.il, caches, hosts);
+        int n_src = 0;
+        for (ggml_tensor * t : { e.src.gate, e.src.up, e.src.down, e.src.gate_up }) {
+            if (!t) {
+                continue;
+            }
+            n_src++;
+            if (!t->buffer || ggml_backend_buffer_get_type(t->buffer) != host) {
+                why = "expert weights are not in pinned host memory (use --cpu-moe-pinned or --auto)";
+                return false;
+            }
+        }
+        if (n != n_src) {
+            why = "unsupported expert tensor layout";
+            return false;
+        }
+        for (int i = 0; i < n; ++i) {
+            const ggml_tensor * h = nullptr;
+            for (ggml_tensor * t : { e.src.gate, e.src.up, e.src.down, e.src.gate_up }) {
+                if (t && t->data == hosts[i]) {
+                    h = t;
+                }
+            }
+            if (!h || h->type != caches[i]->type || h->nb[2] != caches[i]->nb[2] || !ggml_is_contiguous(h)) {
+                why = "cache and host experts differ in layout";
+                return false;
+            }
+        }
+    }
+
+    // ask the backend with a real node
+    const entry & e = entries_[0];
+    ggml_init_params ip = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        why = "out of memory";
+        return false;
+    }
+    ggml_tensor * caches[3];
+    const void  * hosts[3];
+    const int n = cache_srcs((uint32_t) e.src.il, caches, hosts);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, 1);
+    ggml_tensor * op  = ggml_moe_cache(ctx, ids, e.state, caches, hosts, n, (int) bells_src_n_expert(e.src));
+    const bool ok = ggml_backend_supports_op(backend_, op);
+    ggml_free(ctx);
+    if (!ok) {
+        why = "the backend does not implement GGML_OP_MOE_CACHE";
+    }
+    return ok;
+}
+
+void bells_tensors::state_upload(uint32_t il, const std::vector<int32_t> & table) {
+    const entry & e = get(il);
+    if (!e.state) {
+        return;
+    }
+    const int64_t n_expert = bells_src_n_expert(e.src);
+    const int64_t n_slot   = e.n_slot;
+
+    std::vector<int32_t> st(ggml_nelements(e.state), 0);
+    int32_t * map = st.data();
+    int32_t * rev = map + n_expert;
+    std::fill(map, map + n_expert, -1);
+    std::fill(rev, rev + n_slot,   -1);
+    for (int64_t x = 0; x < (int64_t) table.size() && x < n_expert; ++x) {
+        const int32_t sl = table[x];
+        if (sl >= 0 && sl < n_slot) {
+            map[x]  = sl;
+            rev[sl] = (int32_t) x;
+        }
+    }
+    ggml_backend_tensor_set(e.state, st.data(), 0, ggml_nbytes(e.state));
+}
+
+void bells_tensors::state_counts(int64_t out[6]) const {
+    for (int i = 0; i < 6; ++i) {
+        out[i] = 0;
+    }
+    for (const auto & e : entries_) {
+        if (!e.state) {
+            continue;
+        }
+        int32_t hdr[8];
+        ggml_backend_tensor_get(e.state, hdr, ggml_nbytes(e.state) - sizeof(hdr), sizeof(hdr));
+        for (int i = 1; i < 6; ++i) {
+            out[i] += hdr[i];
+        }
+        out[0] = std::max<int64_t>(out[0], hdr[0]);
+    }
+}
+
 void bells_tensors::upload_slots(uint32_t il, const std::vector<int32_t> & table) {
     if (!has(il)) {
         return;
@@ -2494,7 +2727,7 @@ bool bells_runtime::init(const bells_params & params,
                     headroom += (size_t)params.vram_reserve_mib * 1024 * 1024;
                 }
                 // BELLS_PREFILL_STAGE: leave room for one layer's full expert stack
-                if (getenv("BELLS_PREFILL_STAGE") && devices.size() == 1) {
+                if (bells_prefill_stage_wanted() && devices.size() == 1) {
                     headroom += (size_t) bells_tensors::pstage_sets_wanted()*bells_tensors::pstage_bytes(srcs) + 16ull*1024*1024;
                 }
                 budget   = di.free_bytes > headroom ? di.free_bytes - headroom : 0;
@@ -2582,6 +2815,12 @@ bool bells_runtime::init(const bells_params & params,
         }
     }
 
+    const bool want_gpu = [] {
+        const char * g = getenv("BELLS_GPU_RESOLVE");
+        return g && g[0] && g[0] != '0';
+    }();
+    tensors_.set_gpu_state(want_gpu);
+
     bool allocated = false;
     for (int attempt = 0; ; ++attempt) {
         if (tensors_.init(buft, srcs, per_layer_slots, backend, copy_backend, ct)) {
@@ -2608,14 +2847,18 @@ bool bells_runtime::init(const bells_params & params,
         return false;
     }
 
-    if (getenv("BELLS_PREFILL_STAGE") && params.n_slot == 0 && !params.passive) {
+    if (bells_prefill_stage_wanted() && !params.passive) {
         if (const char * m = getenv("BELLS_PREFILL_MIN")) {
             pstage_min_tokens_ = (uint32_t) std::max(1, atoi(m));
         }
         if (tensors_.init_pstage(buft)) {
-            fprintf(stderr, "%s: prompt staging on: %d x %.2f GiB (one layer's experts each%s), used for batches of %u+ tokens\n",
+            fprintf(stderr, "%s: prompt staging on: %d x %.2f GiB (one layer's experts each%s), prompts keep the requested ubatch\n",
                     __func__, tensors_.pstage_n_sets(), bells_tensors::pstage_bytes(srcs)/1024.0/1024.0/1024.0,
-                    tensors_.pstage_n_sets() == 2 ? ", next layer streamed ahead" : "", pstage_min_tokens_);
+                    tensors_.pstage_n_sets() == 2 ? ", next layer streamed ahead" : "");
+            if (pstage_min_tokens_ > 0) {
+                fprintf(stderr, "%s: BELLS_PREFILL_MIN=%u cuts shorter prompts into cache-sized ubatches: faster, "
+                                "but output differs from stock llama.cpp\n", __func__, pstage_min_tokens_);
+            }
         } else {
             fprintf(stderr, "%s: prompt staging unavailable (mixed expert layouts, several devices, or no VRAM)\n", __func__);
         }
@@ -2817,9 +3060,31 @@ bool bells_runtime::init(const bells_params & params,
         params_.max_tokens = std::max(1u, free_slots/std::max(1u, n_expert_used));
     }
 
+    if (want_gpu) {
+        std::string why;
+        if (params_.split > 0) {
+            why = "--bells-split computes part of each layer on the CPU";
+        } else if (params_.n_l2_slot > 0) {
+            why = "the L2 cache is not supported";
+        } else if (params_.max_tokens*std::max(1u, n_expert_used) > 1024) {
+            why = "ubatch too wide for one plan block";
+        } else {
+            tensors_.gpu_state_ok(why);
+        }
+        if (why.empty()) {
+            for (int32_t il : tensors_.layers()) {
+                tensors_.state_upload((uint32_t) il, cache_.slot_table((uint32_t) il));
+            }
+            gpu_resolve_ = true;
+            fprintf(stderr, "%s: BELLS_GPU_RESOLVE on: the device looks up and fills the cache, no routing readback\n", __func__);
+        } else {
+            fprintf(stderr, "%s: BELLS_GPU_RESOLVE off: %s\n", __func__, why.c_str());
+        }
+    }
+
     // Confidence-gated prefetch, off unless a table is supplied. BELLS_CONF sets the threshold;
     // 0.9 is where offline measurement put precision at 73.9%.
-    if (const char * tp = getenv("BELLS_TABLE")) {
+    if (const char * tp = gpu_resolve_ ? nullptr : getenv("BELLS_TABLE")) {
         if (tp[0]) {
             if (const char * ct = getenv("BELLS_CONF")) {
                 conf_thresh_ = (float) atof(ct);
@@ -2873,7 +3138,9 @@ bool bells_runtime::init(const bells_params & params,
     }
 
     // adaptive cache swaps: CLI flag takes precedence, then env var
-    if (params.adapt_every > 0) {
+    if (gpu_resolve_) {
+        // the device owns residency, host swaps would race with it
+    } else if (params.adapt_every > 0) {
         adapt_every_ = params.adapt_every;
         if (params.adapt_decay > 0.0f) {
             adapt_decay_ = params.adapt_decay;
@@ -2940,7 +3207,7 @@ bool bells_runtime::init(const bells_params & params,
 
 bool bells_runtime::init_l2(ggml_backend_buffer_type_t buft, ggml_backend_t l2_backend,
                             uint32_t n_l2_slot) {
-    if (!ready_ || !l2_backend) return false;
+    if (!ready_ || !l2_backend || gpu_resolve_) return false;
 
     uint32_t n_expert = cache_.n_expert();
 
@@ -3432,6 +3699,20 @@ void bells_runtime::begin_ubatch(int32_t token, int32_t pos, int64_t n_tokens) {
         return;
     }
 
+    if (gpu_resolve_) {
+        if (++gpu_report_ % 2000 == 0) {
+            int64_t c[6];
+            tensors_.state_counts(c);
+            fprintf(stderr, "bells_gpu: hit %.1f%% of %lld lookups, %lld fills, %lld overflows\n",
+                    100.0*(double) c[2]/(double) std::max<int64_t>(1, c[1]), (long long) c[1], (long long) c[3], (long long) c[4]);
+            if (c[4] > 0) {
+                fprintf(stderr, "bells_gpu: ERROR: %lld lookups found no slot, output is wrong\n", (long long) c[4]);
+            }
+            fflush(stderr);
+        }
+        return;
+    }
+
     // adaptive pins: decay usage and run background swaps every N decode tokens
     if (adapt_every_ > 0 && (n_tok_seen_ % adapt_every_) == 0) {
         std::vector<bells_cache::adapt_swap> swaps;
@@ -3528,7 +3809,9 @@ bool bells_runtime::on_routing(uint32_t il, const int32_t * experts, size_t n) {
     if (ready_ && staging_now_) {
         if (tensors_.has(il)) {
             const int32_t next = tensors_.next_layer(il);
-            tensors_.stage_layer(il, experts, n, next >= 0 ? &cache_.slot_table((uint32_t) next) : nullptr);
+            // in GPU mode the host table is stale, so do not gather from the cache
+            tensors_.stage_layer(il, experts, n, next >= 0 && !gpu_resolve_ ? &cache_.slot_table((uint32_t) next) : nullptr,
+                                 gpu_resolve_ ? nullptr : &cache_.slot_table(il));
         }
         return true;
     }

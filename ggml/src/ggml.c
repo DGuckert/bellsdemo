@@ -1134,9 +1134,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "MOE_CACHE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1250,9 +1251,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "moe_cache(ids)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3515,6 +3517,49 @@ void ggml_mul_mat_set_hint(
 
     an id of -1 skips the slot: no matrix is selected, c[:,e,t] is set to zero
 */
+// ggml_moe_cache
+
+int64_t ggml_moe_cache_state_size(int n_expert, int n_slot) {
+    return (int64_t) n_expert + 4*(int64_t) n_slot + 8;
+}
+
+struct ggml_tensor * ggml_moe_cache(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * state,
+        struct ggml_tensor ** caches,
+        const void         ** hosts,
+        int                   n_cache,
+        int                   n_expert) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(state));
+    GGML_ASSERT(n_cache >= 1 && n_cache <= 3 && n_expert > 0);
+
+    const int64_t n_slot = caches[0]->ne[2] - 1;
+    GGML_ASSERT(n_slot > 0);
+    GGML_ASSERT(ggml_nelements(state) >= ggml_moe_cache_state_size(n_expert, (int) n_slot));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, ids->ne);
+
+    int32_t params[2 + 2*3] = { n_expert, n_cache };
+    for (int i = 0; i < n_cache; ++i) {
+        GGML_ASSERT(caches[i]->ne[2] == n_slot + 1);
+        GGML_ASSERT(ggml_is_contiguous(caches[i]));
+        GGML_ASSERT(hosts[i] != NULL);
+        memcpy(&params[2 + 2*i], &hosts[i], sizeof(void *));
+    }
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_CACHE;
+    result->src[0] = ids;
+    result->src[1] = state;
+    for (int i = 0; i < n_cache; ++i) {
+        result->src[2 + i] = caches[i];
+    }
+
+    return result;
+}
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

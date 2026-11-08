@@ -284,6 +284,7 @@ set_tests_properties(test-llama-context PROPERTIES
 )
 
 llama_build(test-fusion.cpp)
+llama_build(test-moe-cache.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)

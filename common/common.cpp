@@ -1353,7 +1353,8 @@ static void common_bells_auto_apply(common_params & params, llama_model_params &
 
     // The cache gets about the VRAM fit gave to experts, less two layers for prompt staging. With room for only
     // a few experts per layer it misses too often and is slower than fit's own placement (Mixtral on 24 GB:
-    // 4 of 8 slots, 7.7 vs 9.7 tok/s), so leave fit's placement alone there.
+    // 4 of 8 slots, 7.7 vs 9.7 tok/s), so leave fit's placement alone there. Models with many small experts
+    // route unevenly and need less: Qwen3-30B at 16 of 128 slots runs 34.8 vs 19.5 tok/s.
     const auto get_u32 = [&](const char * key) -> int64_t {
         const int64_t id = gguf_find_key(g.get(), (arch + key).c_str());
         return id >= 0 && gguf_get_kv_type(g.get(), id) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g.get(), id) : -1;
@@ -1363,7 +1364,8 @@ static void common_bells_auto_apply(common_params & params, llama_model_params &
     if (n_expert > 0 && n_expert_used > 0) {
         const double  gpu_share = std::max(0.0, double(n_layer - n_cpu_layers - 2)/double(n_layer));
         const int64_t est_slots = (int64_t) (gpu_share*double(n_expert));
-        if (est_slots < 3*n_expert_used) {
+        const int64_t min_slots = (n_expert >= 64 ? 2 : 3)*n_expert_used;
+        if (est_slots < min_slots) {
             LOG_INF("%s: BELLS not enabled: VRAM holds only about %" PRId64 " of %" PRId64 " experts per layer, "
                     "too few for a cache to beat the default placement\n", __func__, est_slots, n_expert);
             return;
@@ -1422,6 +1424,13 @@ static void common_bells_auto_apply(common_params & params, llama_model_params &
     params.n_gpu_layers  = n_gpu_layers;
     params.bells_enabled = true;
     params.bells_n_slot  = 0;
+    // the cache sizes itself from free VRAM; keep any margin above fit's default 1 GiB free as well
+    {
+        const size_t fitt = *std::max_element(params.fit_params_target.begin(), params.fit_params_target.end());
+        if (fitt > (1024ull << 20)) {
+            params.bells_vram_reserve += (uint32_t) ((fitt - (1024ull << 20)) >> 20);
+        }
+    }
     if (params.bells_adapt == 0) {
         params.bells_adapt = 32;
     }

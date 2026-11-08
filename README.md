@@ -108,7 +108,7 @@ llama-server -m model.gguf
 Run a MoE model the way you would with stock llama.cpp. When it does not fit in VRAM, llama.cpp's `--fit` (on by default) would move expert weights to the CPU and compute them there. BELLS turns itself on at that point instead: the experts stay in RAM and the hot ones are cached on the GPU. The log says `BELLS on: ...` when it does. Output is bit-identical to stock llama.cpp with the whole model on the GPU.
 
 - It stays off when the model fits, for dense models, and when you set `--bells`, `--bells-slots`, `--cpu-moe` or `-ot` yourself.
-- It also stays off when VRAM would hold fewer than 3x the experts each token uses (for example Mixtral 8x7B on 24 GB). The cache cannot beat llama.cpp's own placement there, and the log says so.
+- It also stays off when VRAM would hold fewer than 3x the experts each token uses, or 2x for models with 64 or more experts (for example Mixtral 8x7B on 24 GB). With `-fitt`, the cache keeps the same margin free. The cache cannot beat llama.cpp's own placement there, and the log says so.
 - `--no-bells` (or `LLAMA_ARG_NO_BELLS=1`) keeps stock llama.cpp behaviour.
 
 ### One-flag setup
